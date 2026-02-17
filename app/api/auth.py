@@ -213,7 +213,7 @@ def change_password(
 ):
     try:
         token = authorization.split(" ")[1]
-    except IndexError:
+    except IndexError:  
         raise HTTPException(status_code=401, detail="Invalid authorization header")
 
     payload = decode_access_token(token)
