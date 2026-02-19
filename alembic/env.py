@@ -17,8 +17,9 @@ from app.core.config import settings
 from app.database.base import Base
 
 # IMPORTANT: Import all models here so Alembic detects them
-from app.models.user import User  # add future models here
+from app.models.user import User  
 from app.models.otp import OTP
+from app.models.organizer_application import OrganizerApplication
 
 # -----------------------------
 # Alembic Config
