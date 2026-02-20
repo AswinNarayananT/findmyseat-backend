@@ -1,12 +1,14 @@
 from fastapi import FastAPI
 from app.api.auth import router as auth_router
 from app.api.admin import router as admin_router
+from app.api.organizer import router as organizer_router
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Find My Seat API")
 
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
+app.include_router(organizer_router, prefix="/api/v1")
 
 
 
