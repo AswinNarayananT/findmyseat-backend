@@ -104,7 +104,7 @@ def list_organizer_applications(
 
 
 @router.get(
-    "/admin/organizer-applications/{application_id}",
+    "/organizer-applications/{application_id}",
     response_model=OrganizerApplicationResponse,
 )
 def get_organizer_application_detail(
