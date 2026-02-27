@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, Header
 from sqlalchemy.orm import Session
 from app.database.dependencies import get_db
 from app.models.user import User
-from app.schemas.user import UserRegister, UserLogin, VerifyOtpRequest, ResendOtpRequest, ChangePasswordRequest
+from app.schemas.user import UserRegister, UserLogin, VerifyOtpRequest, ResendOtpRequest, ChangePasswordRequest, UpdateProfileSchema
 from datetime import datetime, timezone, timedelta
 from app.models.otp import OTP
 from app.core.otp import generate_otp, hash_otp
@@ -15,7 +15,8 @@ from app.core.security import (
     verify_password,
     create_access_token,
     create_refresh_token,
-    decode_access_token
+    decode_access_token,
+    get_current_user
 )
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -227,3 +228,32 @@ def change_password(
     db.commit()
 
     return {"message": "Password changed successfully"}
+
+
+
+@router.patch("/update-profile")
+async def update_profile(
+    data: UpdateProfileSchema,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+
+    if data.full_name is not None:
+        current_user.name = data.full_name
+
+    if data.phone is not None:
+        current_user.phone_number = data.phone
+
+    db.commit()
+    db.refresh(current_user)
+
+    return {
+        "message": "Profile updated successfully",
+        "user": {
+            "id": str(current_user.id),
+            "name": current_user.name,
+            "email": current_user.email,
+            "phone_number": current_user.phone_number,
+            "role": current_user.role,
+        },
+    }
