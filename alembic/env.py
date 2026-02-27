@@ -20,6 +20,7 @@ from app.database.base import Base
 from app.models.user import User  
 from app.models.otp import OTP
 from app.models.organizer_application import OrganizerApplication
+from app.models.password_reset import PasswordResetToken
 
 # -----------------------------
 # Alembic Config

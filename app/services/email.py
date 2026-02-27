@@ -49,3 +49,40 @@ async def resend_otp_email(email: str, otp: str):
 
     fm = FastMail(conf)
     await fm.send_message(message)
+
+
+async def send_password_reset_email(email: str, reset_url: str):
+    """
+    Send password reset link to the user's email.
+    """
+
+    message = MessageSchema(
+        subject="Reset Your FindMySeat Password",
+        recipients=[email],
+        body=f"""
+        <h2>FindMySeat Password Reset</h2>
+
+        <p>You requested to reset your password.</p>
+
+        <p>Click the link below to reset your password:</p>
+
+        <p>
+            <a href="{reset_url}" 
+               style="padding:10px 20px;
+                      background-color:#4CAF50;
+                      color:white;
+                      text-decoration:none;
+                      border-radius:5px;">
+                Reset Password
+            </a>
+        </p>
+
+        <p>This link will expire in 15 minutes.</p>
+
+        <p>If you did not request this, please ignore this email.</p>
+        """,
+        subtype="html",
+    )
+
+    fm = FastMail(conf)
+    await fm.send_message(message)

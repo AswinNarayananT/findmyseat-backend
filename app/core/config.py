@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int
     REFRESH_TOKEN_EXPIRE_DAYS: int
 
+    FRONTEND_BASE_URL: str 
+    FRONTEND_RESET_PASSWORD_PATH: str = "/reset-password"
+
     INFOBIP_BASE_URL: str
     INFOBIP_API_KEY: str
     INFOBIP_SENDER: str
