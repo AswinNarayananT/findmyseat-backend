@@ -36,7 +36,6 @@ def submit_organizer_application(
             detail="You have already submitted an application"
         )
 
-    # Optional: prevent duplicate email usage
     existing_email = db.query(OrganizerApplication)\
         .filter(OrganizerApplication.contact_email == data.email)\
         .first()
