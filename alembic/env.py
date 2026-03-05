@@ -21,6 +21,9 @@ from app.models.user import User
 from app.models.otp import OTP
 from app.models.organizer_application import OrganizerApplication
 from app.models.password_reset import PasswordResetToken
+from app.models.event import Event
+from app.models.event_show import EventShow
+from app.models.venue import Venue
 
 # -----------------------------
 # Alembic Config

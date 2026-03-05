@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     MAIL_SSL_TLS: Optional[bool] = None
     MAIL_FROM_NAME: Optional[str] = None
 
+    CLOUDINARY_CLOUD_NAME: str
+    CLOUDINARY_API_KEY: str
+    CLOUDINARY_API_SECRET: str
+    CLOUDINARY_URL: Optional[str] = None
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore"
