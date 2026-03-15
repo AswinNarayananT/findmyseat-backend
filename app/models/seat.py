@@ -1,18 +1,18 @@
 import uuid
 import enum
-import string
-from datetime import datetime
-from sqlalchemy import Integer, String, Numeric, Enum, DateTime
+from datetime import datetime, timedelta
+
+from sqlalchemy import Integer, String, Numeric, Enum, DateTime, Boolean, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
+
 from app.database.base import Base
 
 
-class SeatType(str, enum.Enum):
-    REGULAR = "regular"
-    VIP = "vip"
-    PREMIUM = "premium"
+class SeatType(enum.Enum):
+    SEAT = "seat"
+    AISLE = "aisle"
     EMPTY = "empty"
 
 
@@ -20,83 +20,124 @@ class SeatLayout(Base):
     __tablename__ = "seat_layouts"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    venue_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=True)
-    total_rows: Mapped[int] = mapped_column(Integer, nullable=False)
-    total_columns: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    event_show_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("event_shows.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True
+    )
+
+    rows: Mapped[int] = mapped_column(Integer, nullable=False)
+    columns: Mapped[int] = mapped_column(Integer, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    blocks = relationship("SeatBlock", back_populates="layout", cascade="all, delete-orphan")
+    event_show = relationship("EventShow", back_populates="seat_layout")
+
+    sections = relationship("SeatSection", back_populates="layout", cascade="all, delete-orphan")
+
     seats = relationship("Seat", back_populates="layout", cascade="all, delete-orphan")
-    shows = relationship("EventShow", back_populates="layout")
 
 
-class SeatBlock(Base):
-    __tablename__ = "seat_blocks"
+class SeatSection(Base):
+    __tablename__ = "seat_sections"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    layout_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=True)
-    seat_type: Mapped[SeatType] = mapped_column(Enum(SeatType), nullable=False, default=SeatType.REGULAR)
 
-    num_rows: Mapped[int] = mapped_column(Integer, nullable=False)
-    num_columns: Mapped[int] = mapped_column(Integer, nullable=False)
+    layout_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("seat_layouts.id", ondelete="CASCADE"),
+        nullable=False
+    )
 
-    start_row: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    start_column: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    position: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    layout = relationship("SeatLayout", back_populates="blocks")
-    seats = relationship("Seat", back_populates="block", cascade="all, delete-orphan")
+    price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    color: Mapped[str | None] = mapped_column(String(20))
+
+    layout = relationship("SeatLayout", back_populates="sections")
+
+    seats = relationship("Seat", back_populates="section", cascade="all, delete-orphan")
 
 
 class Seat(Base):
     __tablename__ = "seats"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    layout_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    block_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    row_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    column_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    seat_number: Mapped[str] = mapped_column(String(10), nullable=True)
-    seat_type: Mapped[SeatType] = mapped_column(Enum(SeatType), nullable=False)
-    price: Mapped[float] = mapped_column(Numeric(10,2), nullable=True)
+
+    layout_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("seat_layouts.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    section_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("seat_sections.id", ondelete="SET NULL")
+    )
+
+    row_label: Mapped[str | None] = mapped_column(String(5))
+
+    seat_number: Mapped[int | None] = mapped_column(Integer)
+
+    x_position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    y_position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    seat_type: Mapped[SeatType] = mapped_column(Enum(SeatType, name="seat_type_enum"), nullable=False)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     layout = relationship("SeatLayout", back_populates="seats")
-    block = relationship("SeatBlock", back_populates="seats")
-    bookings = relationship("BookingSeat", back_populates="seat")
+
+    section = relationship("SeatSection", back_populates="seats")
+
+    bookings = relationship("SeatBooking", back_populates="seat", cascade="all, delete-orphan")
 
 
-def generate_seats(layout: SeatLayout):
-    all_seats = []
-    blocks = sorted(layout.blocks, key=lambda b: b.position)
-    current_row_offset = 0
+class SeatBookingStatus(enum.Enum):
+    LOCKED = "locked"
+    BOOKED = "booked"
+    CANCELLED = "cancelled"
 
-    for block in blocks:
-        for r in range(block.num_rows):
-            row_number = current_row_offset + r + 1
-            row_letter = string.ascii_uppercase[row_number - 1]
 
-            for c in range(1, block.num_columns + 1):
-                if block.seat_type == SeatType.EMPTY:
-                    seat = Seat(
-                        layout_id=layout.id,
-                        block_id=block.id,
-                        row_number=row_number,
-                        column_number=c,
-                        seat_number=None,
-                        seat_type=SeatType.EMPTY
-                    )
-                else:
-                    seat_number = f"{row_letter}{c}"
-                    seat = Seat(
-                        layout_id=layout.id,
-                        block_id=block.id,
-                        row_number=row_number,
-                        column_number=c,
-                        seat_number=seat_number,
-                        seat_type=block.seat_type
-                    )
-                all_seats.append(seat)
-        current_row_offset += block.num_rows
-    return all_seats
+class SeatBooking(Base):
+    __tablename__ = "seat_bookings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    seat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("seats.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    event_show_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("event_shows.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    status: Mapped[SeatBookingStatus] = mapped_column(
+        Enum(SeatBookingStatus, name="seat_booking_status_enum"),
+        default=SeatBookingStatus.LOCKED,
+        nullable=False
+    )
+
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    booked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    seat = relationship("Seat", back_populates="bookings")

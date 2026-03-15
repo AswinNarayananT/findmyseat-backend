@@ -72,3 +72,9 @@ class EventShow(Base):
 
     event = relationship("Event", back_populates="shows")
     venue = relationship("Venue", back_populates="shows")
+    seat_layout = relationship(
+    "SeatLayout",
+    back_populates="event_show",
+    uselist=False,
+    cascade="all, delete-orphan"
+    )

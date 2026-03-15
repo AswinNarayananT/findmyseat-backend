@@ -16,6 +16,7 @@ class EventCreate(BaseModel):
 
 class EventResponse(BaseModel):
     id: uuid.UUID
+    organizer_id:uuid.UUID
     title: str
     description: Optional[str]
     entry_type: EntryType

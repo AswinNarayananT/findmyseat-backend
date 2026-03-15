@@ -24,6 +24,7 @@ from app.models.password_reset import PasswordResetToken
 from app.models.event import Event
 from app.models.event_show import EventShow
 from app.models.venue import Venue
+from app.models.seat import SeatLayout, SeatSection, Seat, SeatBooking
 
 # -----------------------------
 # Alembic Config
