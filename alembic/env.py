@@ -25,6 +25,8 @@ from app.models.event import Event
 from app.models.event_show import EventShow
 from app.models.venue import Venue
 from app.models.seat import SeatLayout, SeatSection, Seat, SeatBooking
+from app.models.finance import Wallet, Payment, Transaction
+
 
 # -----------------------------
 # Alembic Config
