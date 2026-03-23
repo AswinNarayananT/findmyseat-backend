@@ -1,13 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from app.database.dependencies import get_db
-from sqlalchemy.orm import Session, joinedload
 from uuid import UUID
 from app.models.event import Event
 from app.models.event_show import EventShow
-from app.models.seat import Seat, SeatLayout, SeatSection
-from typing import List
-import razorpay
+from app.models.seat import Seat, SeatLayout, SeatSection, Booking, SeatBooking, SeatBookingStatus
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -52,6 +49,7 @@ def get_public_event_details(event_id: UUID, db: Session = Depends(get_db)):
     return event
 
 
+
 @router.get("/show/{show_id}/layout")
 def get_show_layout_details(show_id: UUID, db: Session = Depends(get_db)):
     show = db.query(EventShow).options(
@@ -62,7 +60,8 @@ def get_show_layout_details(show_id: UUID, db: Session = Depends(get_db)):
             .joinedload(Seat.section), 
         joinedload(EventShow.seat_layout)
             .joinedload(SeatLayout.seats)
-            .joinedload(Seat.bookings)
+            .joinedload(Seat.seat_bookings)
+            .joinedload(SeatBooking.booking) 
     ).filter(EventShow.id == show_id).first()
 
     if not show:
@@ -86,23 +85,30 @@ async def confirm_and_lock_seats(
     current_user: User = Depends(get_current_user)
 ):
     now = datetime.now()
+    expiry_time = now + timedelta(minutes=10)
+    
     try:
-        unavailable = db.query(SeatBooking).filter(
+        unavailable = db.query(SeatBooking).join(Booking).filter(
             SeatBooking.seat_id.in_(payload.seat_ids),
-            SeatBooking.event_show_id == payload.show_id,
-            (SeatBooking.status == SeatBookingStatus.BOOKED) |
-            ((SeatBooking.status == SeatBookingStatus.LOCKED) & 
-             (SeatBooking.locked_until > now) & 
-             (SeatBooking.user_id != current_user.id))
+            Booking.event_show_id == payload.show_id,
+            (Booking.status == SeatBookingStatus.BOOKED) |
+            ((Booking.status == SeatBookingStatus.LOCKED) & 
+             (Booking.locked_until > now) & 
+             (Booking.user_id != current_user.id))
         ).all()
 
         if unavailable:
-            raise HTTPException(status_code=400, detail="Seats no longer available.")
+            raise HTTPException(status_code=400, detail="One or more seats are no longer available.")
 
-        db.query(SeatBooking).filter(
-            SeatBooking.user_id == current_user.id,
-            SeatBooking.status == SeatBookingStatus.LOCKED
-        ).delete()
+        old_bookings = db.query(Booking).filter(
+            Booking.user_id == current_user.id,
+            Booking.event_show_id == payload.show_id,
+            Booking.status == SeatBookingStatus.LOCKED
+        ).all()
+        
+        for old in old_bookings:
+            db.delete(old) 
+        
         db.flush()
 
         seats_data = db.query(Seat).join(SeatSection).filter(Seat.id.in_(payload.seat_ids)).all()
@@ -110,14 +116,20 @@ async def confirm_and_lock_seats(
 
         razor_order = PaymentService.create_order(amount=int(total_amount * 100))
 
-        expiry_time = now + timedelta(minutes=10)
+        new_booking = Booking(
+            user_id=current_user.id,
+            event_show_id=payload.show_id,
+            status=SeatBookingStatus.LOCKED,
+            locked_until=expiry_time,
+
+        )
+        db.add(new_booking)
+        db.flush() 
+
         for seat_id in payload.seat_ids:
             db.add(SeatBooking(
-                seat_id=seat_id,
-                event_show_id=payload.show_id,
-                user_id=current_user.id,
-                status=SeatBookingStatus.LOCKED,
-                locked_until=expiry_time
+                booking_id=new_booking.id,
+                seat_id=seat_id
             ))
 
         db.add(Payment(
@@ -128,29 +140,34 @@ async def confirm_and_lock_seats(
         ))
 
         db.commit()
+
         return {
+            "booking_id": str(new_booking.id),
             "order_id": razor_order['id'],
             "amount": total_amount,
             "key_id": settings.RAZORPAY_KEY_ID,
             "expiry": expiry_time
         }
+
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in confirm_booking: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to process booking.")
     
 
-from sqlalchemy.orm import joinedload 
 @router.get("/booking/my-active-lock")
 def get_active_user_lock(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     now = datetime.now()
 
-    active_locks = db.query(SeatBooking).filter(
-        SeatBooking.user_id == current_user.id,
-        SeatBooking.status == SeatBookingStatus.LOCKED,
-        SeatBooking.locked_until > now
-    ).all()
+    active_booking = db.query(Booking).options(
+        joinedload(Booking.seat_bookings)
+    ).filter(
+        Booking.user_id == current_user.id,
+        Booking.status == SeatBookingStatus.LOCKED,
+        Booking.locked_until > now
+    ).order_by(Booking.created_at.desc()).first()
 
-    if not active_locks:
+    if not active_booking:
         return {"has_active_lock": False}
 
     latest_payment = db.query(Payment).filter(
@@ -160,9 +177,10 @@ def get_active_user_lock(db: Session = Depends(get_db), current_user: User = Dep
 
     return {
         "has_active_lock": True,
-        "show_id": active_locks[0].event_show_id,
-        "seat_count": len(active_locks),
-        "expires_at": min([l.locked_until for l in active_locks]),
+        "booking_id": str(active_booking.id),
+        "show_id": str(active_booking.event_show_id),
+        "seat_count": len(active_booking.seat_bookings),
+        "expires_at": active_booking.locked_until,
         "total_price": float(latest_payment.amount) if latest_payment else 0,
         "razorpay_order_id": latest_payment.razorpay_order_id if latest_payment else None
     }
@@ -173,7 +191,7 @@ async def verify_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # 1. Verify Signature
+
     is_valid = PaymentService.verify_payment(
         payload['razorpay_order_id'],
         payload['razorpay_payment_id'],
@@ -184,7 +202,6 @@ async def verify_payment(
         raise HTTPException(status_code=400, detail="Payment verification failed.")
 
     try:
-
         payment = db.query(Payment).filter(Payment.razorpay_order_id == payload['razorpay_order_id']).first()
         if not payment:
             raise HTTPException(status_code=404, detail="Payment record not found.")
@@ -193,18 +210,19 @@ async def verify_payment(
         payment.razorpay_payment_id = payload['razorpay_payment_id']
         payment.razorpay_signature = payload['razorpay_signature']
 
-        bookings = db.query(SeatBooking).filter(
-            SeatBooking.user_id == current_user.id,
-            SeatBooking.status == SeatBookingStatus.LOCKED,
-            SeatBooking.locked_until > datetime.now()
-        ).all()
+        booking = db.query(Booking).options(
+            joinedload(Booking.seat_bookings)
+        ).filter(
+            Booking.user_id == current_user.id,
+            Booking.status == SeatBookingStatus.LOCKED,
+            Booking.locked_until > datetime.now()
+        ).order_by(Booking.created_at.desc()).first()
 
-        if not bookings:
-             raise HTTPException(status_code=400, detail="No active locks found. Perhaps time expired?")
+        if not booking:
+             raise HTTPException(status_code=400, detail="No active locks found. Session may have expired.")
 
-        for b in bookings:
-            b.status = SeatBookingStatus.BOOKED
-            b.booked_at = func.now()
+        booking.status = SeatBookingStatus.BOOKED
+        booking.booked_at = func.now()
 
         admin = db.query(User).options(joinedload(User.wallet)).filter(User.role == UserRole.ADMIN).first()
         
@@ -216,88 +234,72 @@ async def verify_payment(
             receiver_wallet_id=admin.wallet.id,
             amount=payment.amount,
             tx_type=TransactionType.BOOKING,
-            description=f"Booking for {len(bookings)} seats"
+            description=f"Booking ID: {booking.id} - {len(booking.seat_bookings)} seats"
         ))
 
         admin.wallet.balance = float(admin.wallet.balance) + float(payment.amount)
 
         db.commit()
-        return {"status": "success", "message": "Tickets booked successfully!"}
+        return {
+            "status": "success", 
+            "message": "Tickets booked successfully!", 
+            "booking_id": str(booking.id)
+        }
 
     except Exception as e:
         db.rollback()
         print(f"VERIFY ERROR: {str(e)}")
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail="Internal Server Error during verification.")
 
-
-from sqlalchemy.orm import joinedload
-from app.models.event import Event
-from app.models.event_show import EventShow
-from app.models.seat import Seat, SeatSection, SeatBooking, SeatBookingStatus
-from app.models.venue import Venue
 
 @router.get("/booking/my-bookings")
 def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
         bookings = (
-            db.query(SeatBooking)
+            db.query(Booking)
             .options(
-                joinedload(SeatBooking.event_show).joinedload(EventShow.event),
-                joinedload(SeatBooking.event_show).joinedload(EventShow.venue),
-                joinedload(SeatBooking.seat).joinedload(Seat.section),
+                joinedload(Booking.event_show).joinedload(EventShow.event),
+                joinedload(Booking.event_show).joinedload(EventShow.venue),
+                joinedload(Booking.seat_bookings).joinedload(SeatBooking.seat).joinedload(Seat.section),
             )
             .filter(
-                SeatBooking.user_id == current_user.id,
-                SeatBooking.status == SeatBookingStatus.BOOKED
+                Booking.user_id == current_user.id,
+                Booking.status == SeatBookingStatus.BOOKED 
             )
-            .order_by(SeatBooking.created_at.desc())
+            .order_by(Booking.created_at.desc())
             .all()
         )
 
-        return [{
-            "id": str(b.id),
-            "event_name": b.event_show.event.title,
-            "event_image": b.event_show.event.image_url,
-            "event_date": b.event_show.start_time.strftime("%d %b %Y"),
-            "show_time": b.event_show.start_time.strftime("%I:%M %p"),
-            "venue_name": b.event_show.venue.name,
-            "venue_address": b.event_show.venue.formatted_address,
-            "seat_label": f"{b.seat.row_label}{b.seat.seat_number}" if b.seat.row_label else str(b.seat.seat_number),
-            "section_name": b.seat.section.name,
-            "created_at": b.created_at
-        } for b in bookings]
+        return [
+            {
+                "id": str(b.id),
+                "event_show_id": str(b.event_show_id),
+                "event_name": b.event_show.event.title,
+                "event_image": b.event_show.event.image_url,
+                "event_date": b.event_show.start_time.strftime("%d %b %Y"),
+                "show_time": b.event_show.start_time.strftime("%I:%M %p"),
+                "venue_name": b.event_show.venue.name,
+                "venue_address": b.event_show.venue.formatted_address,
+                "status": b.status.value,            
+                "is_checked_in": b.is_checked_in,
+                "checked_in_at": b.checked_in_at,
+                "total_seats": len(b.seat_bookings),
+                "seats": [
+                    {
+                        "booking_id": str(sb.id),
+                        "seat_label": f"{sb.seat.row_label}{sb.seat.seat_number}" if sb.seat.row_label else str(sb.seat.seat_number),
+                        "section_name": sb.seat.section.name,
+                    }
+                    for sb in b.seat_bookings
+                ],
+                "created_at": b.created_at,
+            }
+            for b in bookings
+        ]
 
     except Exception as e:
         print(f"CRITICAL API ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-        
-    except Exception as e:
-        # This will help you see the exact error in the terminal
-        print(f"CRITICAL API ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
 
-
-@router.post("/booking/verify-checkin/{booking_id}")
-async def verify_checkin(
-    booking_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    if current_user.role not in [UserRole.ORGANIZER, UserRole.ADMIN]:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    booking = db.query(SeatBooking).filter(SeatBooking.id == booking_id).first()
-    
-    if not booking:
-        raise HTTPException(status_code=404, detail="Invalid Ticket")
-    
-    if booking.status != SeatBookingStatus.BOOKED:
-        raise HTTPException(status_code=400, detail="Ticket not paid/confirmed")
-
-    if booking.is_checked_in:
-        raise HTTPException(status_code=400, detail="Ticket already used for entry!")
-
-    booking.is_checked_in = True
-    db.commit()
-
-    return {"status": "success", "message": "Access Granted! Welcome to the event."}

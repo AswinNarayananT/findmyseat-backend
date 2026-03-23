@@ -96,7 +96,8 @@ class Seat(Base):
 
     section = relationship("SeatSection", back_populates="seats")
 
-    bookings = relationship("SeatBooking", back_populates="seat", cascade="all, delete-orphan")
+    seat_bookings = relationship("SeatBooking", back_populates="seat", cascade="all, delete-orphan")
+
 
 
 class SeatBookingStatus(enum.Enum):
@@ -105,27 +106,23 @@ class SeatBookingStatus(enum.Enum):
     CANCELLED = "cancelled"
 
 
-class SeatBooking(Base):
-    __tablename__ = "seat_bookings"
+class Booking(Base):
+    __tablename__ = "bookings"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    seat_id: Mapped[uuid.UUID] = mapped_column(
+    user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("seats.id", ondelete="CASCADE"),
-        nullable=False
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
     )
 
     event_show_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("event_shows.id", ondelete="CASCADE"),
-        nullable=False
-    )
-
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False
+        nullable=False,
+        index=True
     )
 
     status: Mapped[SeatBookingStatus] = mapped_column(
@@ -134,12 +131,36 @@ class SeatBooking(Base):
         nullable=False
     )
 
+    is_checked_in: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    checked_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
     booked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    event_show = relationship("EventShow")
+    seat_bookings = relationship("SeatBooking", back_populates="booking", cascade="all, delete-orphan")
+
+
+class SeatBooking(Base):
+    __tablename__ = "seat_bookings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    booking_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("bookings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    seat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("seats.id", ondelete="CASCADE"),
+        nullable=False
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    seat = relationship("Seat", back_populates="bookings")
-    event_show = relationship("EventShow")      
-    user = relationship("User")   
+    booking = relationship("Booking", back_populates="seat_bookings")
+    seat = relationship("Seat", back_populates="seat_bookings")  
