@@ -30,6 +30,16 @@ def get_admin_user(
         )
     return current_user
 
+
+@router.get("/me")
+def get_admin_me(admin_user: User = Depends(get_admin_user)):
+    return {
+        "id": str(admin_user.id),
+        "name": admin_user.name,
+        "email": admin_user.email,
+        "role": admin_user.role,
+    }
+
 @router.post("/login")
 def admin_login(
     payload: UserLogin,
@@ -73,6 +83,17 @@ def admin_login(
             "role": user.role,
         },
     }
+
+
+@router.post("/logout")
+def logout(response: Response):
+    response.delete_cookie(
+        key="refresh_token",
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
+    return {"message": "Logged out successfully"}
 
 
 @router.get(

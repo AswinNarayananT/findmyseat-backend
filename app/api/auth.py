@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, Header
+from fastapi import APIRouter, Depends, HTTPException,Request, Response, status, Header
 from sqlalchemy.orm import Session
 from app.database.dependencies import get_db
 from app.models.user import User
+from app.models.finance import Wallet
 from app.schemas.user import UserRegister, UserLogin, VerifyOtpRequest, ResendOtpRequest, ChangePasswordRequest, UpdateProfileSchema
 from datetime import datetime, timezone, timedelta
 from app.models.otp import OTP
@@ -16,6 +17,7 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_access_token,
+    decode_refresh_token,
     get_current_user
 )
 
@@ -26,43 +28,50 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 @router.post("/register")
 async def register(user_data: UserRegister, db: Session = Depends(get_db)):
-
     if db.query(User).filter(User.email == user_data.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
     if db.query(User).filter(User.phone_number == user_data.phone_number).first():
         raise HTTPException(status_code=400, detail="Phone number already registered")
 
-    user = User(
-        name=user_data.name,
-        email=user_data.email,
-        phone_number=user_data.phone_number,
-        password=hash_password(user_data.password),
-        is_otp_verified=False,
-    )
+    try:
+        user = User(
+            name=user_data.name,
+            email=user_data.email,
+            phone_number=user_data.phone_number,
+            password=hash_password(user_data.password),
+            is_otp_verified=False,
+        )
+        db.add(user)
+        db.flush()
 
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+        wallet = Wallet(
+            user_id=user.id,
+            balance=0.0
+        )
+        db.add(wallet)
 
-    otp_code = generate_otp()
+        otp_code = generate_otp()
+        otp_record = OTP(
+            phone_number=user.phone_number,
+            otp_hash=hash_otp(otp_code),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES),
+        )
+        db.add(otp_record)
+        
+        db.commit()
+        db.refresh(user)
 
-    otp_record = OTP(
-        phone_number=user.phone_number,
-        otp_hash=hash_otp(otp_code),
-        expires_at=datetime.now(timezone.utc)
-        + timedelta(minutes=settings.OTP_EXPIRE_MINUTES),
-    )
+        await send_otp_email(user.email, otp_code)
 
-    db.add(otp_record)
-    db.commit()
+        return {
+            "message": "User registered successfully. OTP sent to email.",
+            "user_id": str(user.id),
+        }
 
-    await send_otp_email(user.email, otp_code)
-
-    return {
-        "message": "User registered successfully. OTP sent to email.",
-        "user_id": str(user.id),
-    }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 
 
@@ -196,6 +205,69 @@ def login(user_data: UserLogin, response: Response, db: Session = Depends(get_db
             "role": user.role,
         },
     }
+
+
+@router.post("/logout")
+def logout(response: Response):
+    response.delete_cookie(
+        key="refresh_token",
+        httponly=True,
+        samesite="lax",
+    )
+    return {"message": "Logged out successfully"}
+
+
+
+@router.get("/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": str(current_user.id),
+        "name": current_user.name,
+        "email": current_user.email,
+        "phone_number": current_user.phone_number,
+        "role": current_user.role,
+    }
+
+@router.post("/refresh")
+def refresh_token(request: Request, db: Session = Depends(get_db)):
+    refresh_token = request.cookies.get("refresh_token")
+    
+    if not refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Refresh token missing"
+        )
+
+    try:
+        payload = decode_refresh_token(refresh_token)
+        user_id = payload.get("sub")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invalid token payload"
+            )
+            
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="User not found"
+            )
+
+        new_access_token = create_access_token({"sub": str(user.id)})
+        
+        return {
+            "access_token": new_access_token,
+            "token_type": "Bearer"
+        }
+
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Invalid or expired refresh token"
+        )
+
 
 
 @router.post("/change-password")

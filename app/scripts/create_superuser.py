@@ -2,6 +2,7 @@ from getpass import getpass
 from sqlalchemy.orm import Session
 from app.database.session import SessionLocal
 from app.models.user import User
+from app.models.finance import Wallet
 from app.core.security import hash_password
 
 
@@ -15,13 +16,11 @@ def create_superuser():
         email = input("Email: ").strip()
         phone_number = input("Phone Number: ").strip()
 
-        # Check if user already exists
         existing_user = db.query(User).filter(User.email == email).first()
         if existing_user:
             print("❌ User with this email already exists")
             return
 
-        # Password confirmation loop
         while True:
             password = getpass("Password: ")
             confirm_password = getpass("Confirm Password: ")
@@ -47,10 +46,20 @@ def create_superuser():
         )
 
         db.add(user)
+        db.flush()
+
+        wallet = Wallet(
+            user_id=user.id,
+            balance=0.0
+        )
+        db.add(wallet)
+
         db.commit()
+        print("✅ Superuser and Admin Wallet created successfully!")
 
-        print("✅ Superuser created successfully!")
-
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error creating superuser: {str(e)}")
     finally:
         db.close()
 

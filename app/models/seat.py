@@ -141,3 +141,5 @@ class SeatBooking(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     seat = relationship("Seat", back_populates="bookings")
+    event_show = relationship("EventShow")      
+    user = relationship("User")   

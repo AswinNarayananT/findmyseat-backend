@@ -87,34 +87,29 @@ async def confirm_and_lock_seats(
 ):
     now = datetime.now()
     try:
-        # 1. First, check if the NEW seats are available
         unavailable = db.query(SeatBooking).filter(
             SeatBooking.seat_id.in_(payload.seat_ids),
             SeatBooking.event_show_id == payload.show_id,
             (SeatBooking.status == SeatBookingStatus.BOOKED) |
             ((SeatBooking.status == SeatBookingStatus.LOCKED) & 
              (SeatBooking.locked_until > now) & 
-             (SeatBooking.user_id != current_user.id)) # Ignore user's own locks
+             (SeatBooking.user_id != current_user.id))
         ).all()
 
         if unavailable:
             raise HTTPException(status_code=400, detail="Seats no longer available.")
 
-        # 2. Clear ONLY the user's previous locks for this specific show
         db.query(SeatBooking).filter(
             SeatBooking.user_id == current_user.id,
             SeatBooking.status == SeatBookingStatus.LOCKED
         ).delete()
         db.flush()
 
-        # 3. Calculate Price
         seats_data = db.query(Seat).join(SeatSection).filter(Seat.id.in_(payload.seat_ids)).all()
         total_amount = sum([float(s.section.price) for s in seats_data])
 
-        # 4. Create External Order
         razor_order = PaymentService.create_order(amount=int(total_amount * 100))
 
-        # 5. Create new Locks
         expiry_time = now + timedelta(minutes=10)
         for seat_id in payload.seat_ids:
             db.add(SeatBooking(
@@ -144,7 +139,7 @@ async def confirm_and_lock_seats(
         raise HTTPException(status_code=500, detail=str(e))
     
 
-from sqlalchemy.orm import joinedload # Add this import
+from sqlalchemy.orm import joinedload 
 @router.get("/booking/my-active-lock")
 def get_active_user_lock(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     now = datetime.now()
@@ -158,8 +153,6 @@ def get_active_user_lock(db: Session = Depends(get_db), current_user: User = Dep
     if not active_locks:
         return {"has_active_lock": False}
 
-    # IMPORTANT: We need the Payment record to get the Order ID and Price
-    # We find the latest PENDING payment for this user
     latest_payment = db.query(Payment).filter(
         Payment.user_id == current_user.id,
         Payment.status == PaymentStatus.PENDING
@@ -170,7 +163,6 @@ def get_active_user_lock(db: Session = Depends(get_db), current_user: User = Dep
         "show_id": active_locks[0].event_show_id,
         "seat_count": len(active_locks),
         "expires_at": min([l.locked_until for l in active_locks]),
-        # Add these fields so the frontend doesn't crash or show "No Session"
         "total_price": float(latest_payment.amount) if latest_payment else 0,
         "razorpay_order_id": latest_payment.razorpay_order_id if latest_payment else None
     }
@@ -192,7 +184,7 @@ async def verify_payment(
         raise HTTPException(status_code=400, detail="Payment verification failed.")
 
     try:
-        # 2. Update Payment
+
         payment = db.query(Payment).filter(Payment.razorpay_order_id == payload['razorpay_order_id']).first()
         if not payment:
             raise HTTPException(status_code=404, detail="Payment record not found.")
@@ -201,7 +193,6 @@ async def verify_payment(
         payment.razorpay_payment_id = payload['razorpay_payment_id']
         payment.razorpay_signature = payload['razorpay_signature']
 
-        # 3. Process Bookings
         bookings = db.query(SeatBooking).filter(
             SeatBooking.user_id == current_user.id,
             SeatBooking.status == SeatBookingStatus.LOCKED,
@@ -215,13 +206,11 @@ async def verify_payment(
             b.status = SeatBookingStatus.BOOKED
             b.booked_at = func.now()
 
-        # 4. FIX: Use joinedload to fetch Admin and Wallet in ONE query
         admin = db.query(User).options(joinedload(User.wallet)).filter(User.role == UserRole.ADMIN).first()
         
         if not admin or not admin.wallet:
             raise HTTPException(status_code=500, detail="Admin wallet system not found.")
 
-        # 5. Internal Ledger
         db.add(Transaction(
             payment_id=payment.id,
             receiver_wallet_id=admin.wallet.id,
@@ -229,8 +218,7 @@ async def verify_payment(
             tx_type=TransactionType.BOOKING,
             description=f"Booking for {len(bookings)} seats"
         ))
-        
-        # Perform the balance update
+
         admin.wallet.balance = float(admin.wallet.balance) + float(payment.amount)
 
         db.commit()
@@ -238,6 +226,78 @@ async def verify_payment(
 
     except Exception as e:
         db.rollback()
-        # Log the actual error to your terminal so you can see it
         print(f"VERIFY ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error during verification.")
+
+
+from sqlalchemy.orm import joinedload
+from app.models.event import Event
+from app.models.event_show import EventShow
+from app.models.seat import Seat, SeatSection, SeatBooking, SeatBookingStatus
+from app.models.venue import Venue
+
+@router.get("/booking/my-bookings")
+def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        bookings = (
+            db.query(SeatBooking)
+            .options(
+                joinedload(SeatBooking.event_show).joinedload(EventShow.event),
+                joinedload(SeatBooking.event_show).joinedload(EventShow.venue),
+                joinedload(SeatBooking.seat).joinedload(Seat.section),
+            )
+            .filter(
+                SeatBooking.user_id == current_user.id,
+                SeatBooking.status == SeatBookingStatus.BOOKED
+            )
+            .order_by(SeatBooking.created_at.desc())
+            .all()
+        )
+
+        return [{
+            "id": str(b.id),
+            "event_name": b.event_show.event.title,
+            "event_image": b.event_show.event.image_url,
+            "event_date": b.event_show.start_time.strftime("%d %b %Y"),
+            "show_time": b.event_show.start_time.strftime("%I:%M %p"),
+            "venue_name": b.event_show.venue.name,
+            "venue_address": b.event_show.venue.formatted_address,
+            "seat_label": f"{b.seat.row_label}{b.seat.seat_number}" if b.seat.row_label else str(b.seat.seat_number),
+            "section_name": b.seat.section.name,
+            "created_at": b.created_at
+        } for b in bookings]
+
+    except Exception as e:
+        print(f"CRITICAL API ERROR: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    except Exception as e:
+        # This will help you see the exact error in the terminal
+        print(f"CRITICAL API ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@router.post("/booking/verify-checkin/{booking_id}")
+async def verify_checkin(
+    booking_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in [UserRole.ORGANIZER, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    booking = db.query(SeatBooking).filter(SeatBooking.id == booking_id).first()
+    
+    if not booking:
+        raise HTTPException(status_code=404, detail="Invalid Ticket")
+    
+    if booking.status != SeatBookingStatus.BOOKED:
+        raise HTTPException(status_code=400, detail="Ticket not paid/confirmed")
+
+    if booking.is_checked_in:
+        raise HTTPException(status_code=400, detail="Ticket already used for entry!")
+
+    booking.is_checked_in = True
+    db.commit()
+
+    return {"status": "success", "message": "Access Granted! Welcome to the event."}
