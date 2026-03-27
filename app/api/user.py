@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, contains_eager
 from app.database.dependencies import get_db
 from uuid import UUID
 from app.models.event import Event
@@ -22,29 +22,58 @@ router = APIRouter(prefix="/public/events", tags=["Public Events"])
 
 @router.get("/")
 def list_active_events(db: Session = Depends(get_db)):
-    """
-    Fetch all active events with their associated shows and venues.
-    """
-    events = db.query(Event).options(
-        joinedload(Event.shows).joinedload(EventShow.venue)
-    ).filter(
-        Event.is_active == True
+    now = datetime.now()
+
+    events = db.query(Event).join(Event.shows).join(EventShow.seat_layout).filter(
+        Event.is_active == True,
+        EventShow.start_time > now,
+        EventShow.is_cancelled == False
+    ).options(
+        contains_eager(Event.shows).options(
+            joinedload(EventShow.venue),
+            contains_eager(EventShow.seat_layout)
+        )
     ).order_by(Event.created_at.desc()).all()
 
     return events
 
+# @router.get("/{event_id}")
+# def get_public_event_details(event_id: UUID, db: Session = Depends(get_db)):
+#     event = db.query(Event).options(
+#         joinedload(Event.shows).joinedload(EventShow.venue),
+#         joinedload(Event.shows).joinedload(EventShow.seat_layout)
+#     ).filter(
+#         Event.id == event_id,
+#         Event.is_active == True 
+#     ).first()
+
+#     if not event:
+#         raise HTTPException(status_code=404, detail="Event not found or is no longer active")
+
+#     return event
+
+
 @router.get("/{event_id}")
 def get_public_event_details(event_id: UUID, db: Session = Depends(get_db)):
-    event = db.query(Event).options(
-        joinedload(Event.shows).joinedload(EventShow.venue),
-        joinedload(Event.shows).joinedload(EventShow.seat_layout)
-    ).filter(
+    now = datetime.now()
+
+    event = db.query(Event).join(Event.shows).join(EventShow.seat_layout).filter(
         Event.id == event_id,
-        Event.is_active == True 
-    ).first()
+        Event.is_active == True,
+        EventShow.start_time > now,
+        EventShow.is_cancelled == False
+    ).options(
+        contains_eager(Event.shows).options(
+            joinedload(EventShow.venue),
+            contains_eager(EventShow.seat_layout).joinedload(SeatLayout.sections)
+        )
+    ).populate_existing().first()
 
     if not event:
-        raise HTTPException(status_code=404, detail="Event not found or is no longer active")
+        raise HTTPException(
+            status_code=404, 
+            detail="Event not found or has no upcoming shows with ready layouts."
+        )
 
     return event
 
