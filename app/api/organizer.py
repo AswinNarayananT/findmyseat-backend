@@ -10,7 +10,7 @@ from app.database.dependencies import get_db
 from app.core.security import get_current_user
 from app.models.user import User, UserRole
 from app.models.event_show import EventShow
-from app.models.organizer_application import OrganizerApplication
+from app.models.organizer_application import OrganizerApplication, OrganizerStatus
 from app.schemas.organizer_application import (
     OrganizerApplicationCreate,
     OrganizerApplicationResponse
@@ -19,6 +19,25 @@ from app.models.seat import Booking, SeatBooking, SeatBookingStatus
 
 router = APIRouter(prefix="/organizers", tags=["Organizer Applications"])
 
+@router.get(
+    "/my-application",
+    response_model=OrganizerApplicationResponse
+)
+def get_my_application(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    application = db.query(OrganizerApplication).filter(
+        OrganizerApplication.user_id == current_user.id
+    ).first()
+
+    if not application:
+        raise HTTPException(
+            status_code=404,
+            detail="No application found for this user."
+        )
+
+    return application
 
 @router.post(
     "/apply",
@@ -30,17 +49,40 @@ def submit_organizer_application(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
-    # Prevent duplicate application per user
-    existing_user_application = db.query(OrganizerApplication)\
+    app = db.query(OrganizerApplication)\
         .filter(OrganizerApplication.user_id == current_user.id)\
         .first()
 
-    if existing_user_application:
-        raise HTTPException(
-            status_code=400,
-            detail="You have already submitted an application"
-        )
+    if app:
+        if app.status == OrganizerStatus.approved:
+            raise HTTPException(status_code=400, detail="You are already an approved organizer.")
+        
+        if app.status == OrganizerStatus.pending:
+            raise HTTPException(status_code=400, detail="You have a pending application. Please wait for review.")
+
+        if app.status == OrganizerStatus.permanently_rejected or app.rejection_count >= 3:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Application permanently rejected. You have reached the maximum limit of 3 attempts."
+            )
+
+        app.organization_name = data.organization_or_individual_name
+        app.address = data.address
+        app.contact_name = data.contact_name
+        app.contact_email = data.email
+        app.contact_phone = data.phone_number
+        app.beneficiary_name = data.beneficiary_name
+        app.account_type = data.account_type
+        app.bank_name = data.bank_name
+        app.account_number = data.account_number
+        app.ifsc_code = data.ifsc_code
+
+        app.status = OrganizerStatus.pending
+        app.current_rejection_reason = None 
+        
+        db.commit()
+        db.refresh(app)
+        return app
 
     existing_email = db.query(OrganizerApplication)\
         .filter(OrganizerApplication.contact_email == data.email)\
@@ -52,10 +94,8 @@ def submit_organizer_application(
             detail="Application already submitted with this email"
         )
 
-    application = OrganizerApplication(
-
+    new_application = OrganizerApplication(
         user_id=current_user.id,
-
         organization_name=data.organization_or_individual_name,
         address=data.address,
         contact_name=data.contact_name,
@@ -67,14 +107,15 @@ def submit_organizer_application(
         account_number=data.account_number,
         ifsc_code=data.ifsc_code,
         is_verified=False,
-        status="pending"
+        status=OrganizerStatus.pending,
+        rejection_count=0
     )
 
-    db.add(application)
+    db.add(new_application)
     db.commit()
-    db.refresh(application)
+    db.refresh(new_application)
 
-    return application
+    return new_application
 
 @router.post("/booking/verify-checkin/{show_id}/{booking_id}")
 async def verify_checkin(

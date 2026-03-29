@@ -1,11 +1,8 @@
 from pydantic import BaseModel, EmailStr
 from uuid import UUID
 from datetime import datetime
-from enum import Enum
-from typing import Optional
+from typing import Optional, List, Any
 from app.models.organizer_application import OrganizerStatus
-
-
 
 class OrganizerApplicationCreate(BaseModel):
     organization_or_individual_name: str
@@ -19,6 +16,14 @@ class OrganizerApplicationCreate(BaseModel):
     account_number: str
     ifsc_code: str
 
+class OrganizerApplicationHistoryResponse(BaseModel):
+    id: UUID
+    rejection_reason: str
+    snapshot_data: Optional[Any] = None
+    rejected_at: datetime
+
+    class Config:
+        from_attributes = True
 
 class OrganizerApplicationResponse(BaseModel):
     id: UUID
@@ -35,13 +40,14 @@ class OrganizerApplicationResponse(BaseModel):
     ifsc_code: str
     is_verified: bool
     status: OrganizerStatus
-    rejection_reason: Optional[str] = None   
-    created_at: datetime                     
-    updated_at: Optional[datetime] = None   
+    current_rejection_reason: Optional[str] = None
+    rejection_count: int
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    history: List[OrganizerApplicationHistoryResponse] = []
 
     class Config:
         from_attributes = True
-
 
 class OrganizerStatusUpdate(BaseModel):
     status: OrganizerStatus
