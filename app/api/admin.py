@@ -23,6 +23,7 @@ from app.core.security import (
 )
 from uuid import UUID
 from sqlalchemy.orm import Session, joinedload
+from app.core.notifications import manager
 
 router = APIRouter(prefix="/admin", tags=["adminAuth"])
 
@@ -174,7 +175,7 @@ def get_organizer_application_detail(
     "/organizer-applications/{application_id}",
     response_model=OrganizerApplicationResponse
 )
-def update_organizer_application_status(
+async def update_organizer_application_status(
     application_id: UUID,
     payload: OrganizerStatusUpdate,
     db: Session = Depends(get_db),
@@ -238,6 +239,12 @@ def update_organizer_application_status(
         user = db.query(User).filter(User.id == application.user_id).first()
         if user:
             user.role = "organizer"
+            
+        await manager.send_personal_message({
+            "type": "APPLICATION_ACCEPTED",
+            "title": "Application Approved",
+            "message": "Your organizer application has been approved!"
+        }, str(application.user_id))
 
     db.commit()
     db.refresh(application)

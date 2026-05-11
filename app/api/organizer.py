@@ -1,7 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from uuid import uuid4
-from uuid import UUID
+from uuid import UUID, uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 from datetime import datetime, timezone
@@ -18,7 +16,12 @@ from app.schemas.organizer_application import (
     OrganizerApplicationCreate,
     OrganizerApplicationResponse
 )
+from app.schemas.event import CancelReasonRequest
+from app.schemas.event_show import VenueUpdate, ShowTimeUpdate
 from app.models.seat import Booking, SeatBooking, SeatBookingStatus
+from app.models.venue import Venue
+from datetime import timedelta
+from app.core.notifications import manager
 
 router = APIRouter(prefix="/organizers", tags=["Organizer Applications"])
 
@@ -297,12 +300,10 @@ def claim_organizer_revenue(
         raise HTTPException(status_code=500, detail="Failed to process claim")
     
 
-
-
 @router.post("/show/{show_id}/cancel")
-def cancel_event_show(
+async def cancel_event_show(
     show_id: UUID,
-    reason: str,
+    reason: CancelReasonRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -316,8 +317,14 @@ def cancel_event_show(
         raise HTTPException(status_code=404, detail="Show not found")
     if show.is_cancelled:
         raise HTTPException(status_code=400, detail="Show already cancelled")
+    if show.event.is_active is False:
+        raise HTTPException(status_code=400, detail="Cannot cancel a show for an inactive event")
     if show.is_payout_processed:
         raise HTTPException(status_code=400, detail="Cannot cancel after revenue is claimed")
+
+    now = datetime.now(timezone.utc)
+    if show.start_time < now:
+        raise HTTPException(status_code=400, detail="Cannot cancel a show that has already started or passed")
 
     bookings = db.query(Booking).filter(
         Booking.event_show_id == show_id,
@@ -346,23 +353,34 @@ def cancel_event_show(
             sb.status = SeatBookingStatus.CANCELLED
 
     show.is_cancelled = True
-    show.cancellation_reason = reason
+    show.cancellation_reason = reason.reason
+
+    unique_users = len(set(b.user_id for b in bookings))
 
     try:
         db.commit()
-        return {"message": f"Show cancelled and {len(bookings)} refunds processed."}
+        
+        for uid in set(b.user_id for b in bookings):
+            await manager.send_personal_message({
+                "type": "SHOW_CANCELLED",
+                "title": "Show Cancelled",
+                "message": f"Show for {show.event.title} has been cancelled. Refund initiated."
+            }, str(uid))
+            
+        return {
+            "status": "success",
+            "message": f"Show cancelled. {len(bookings)} bookings refunded for {unique_users} users.",
+            "refunded_bookings_count": len(bookings),
+            "refunded_users_count": unique_users
+        }
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail="Refund processing failed")
     
-from pydantic import BaseModel
-class Resonresponse(BaseModel):
-    reason:str
-
 @router.post("/event/{event_id}/cancel")
-def cancel_full_event(
+async def cancel_full_event(
     event_id: UUID,
-    reason: Resonresponse,
+    reason: CancelReasonRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -376,14 +394,22 @@ def cancel_full_event(
     
     if event.is_cancelled:
         raise HTTPException(status_code=400, detail="Event is already cancelled")
+    
+    if not event.is_active:
+        raise HTTPException(status_code=400, detail="Event is already inactive")
 
     shows = db.query(EventShow).filter(
         EventShow.event_id == event_id,
         EventShow.is_cancelled == False
     ).all()
 
+    now = datetime.now(timezone.utc)
+    if shows and all(show.start_time < now for show in shows):
+        raise HTTPException(status_code=400, detail="Cannot cancel an event where all shows have already passed")
+
     admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
     total_refunded_bookings = 0
+    unique_users_set = set()
 
     for show in shows:
         if show.is_payout_processed:
@@ -395,6 +421,7 @@ def cancel_full_event(
         ).all()
 
         for booking in bookings:
+            unique_users_set.add(booking.user_id)
             refund_amount = float(booking.total_price)
             user_wallet = db.query(Wallet).filter(Wallet.user_id == booking.user_id).first()
 
@@ -416,17 +443,123 @@ def cancel_full_event(
             total_refunded_bookings += 1
 
         show.is_cancelled = True
-        show.cancellation_reason = reason
+        show.cancellation_reason = reason.reason
 
     event.is_cancelled = True
+    event.cancellation_reason = reason.reason
     event.is_active = False
 
     try:
         db.commit()
+        
+        for uid in unique_users_set:
+            await manager.send_personal_message({
+                "type": "EVENT_CANCELLED",
+                "title": "Event Cancelled",
+                "message": f"Event {event.title} has been cancelled. Refund initiated."
+            }, str(uid))
+
         return {
             "status": "success", 
-            "message": f"Event and {len(shows)} shows cancelled. {total_refunded_bookings} bookings refunded."
+            "message": f"Event and {len(shows)} shows cancelled. {total_refunded_bookings} bookings refunded for {len(unique_users_set)} users.",
+            "refunded_bookings_count": total_refunded_bookings,
+            "refunded_users_count": len(unique_users_set)
         }
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to process full event cancellation")
+
+@router.put("/event/{event_id}/location")
+async def update_event_location(
+    event_id: UUID,
+    payload: VenueUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(
+        Event.id == event_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    shows = db.query(EventShow).filter(EventShow.event_id == event_id).all()
+    if not shows:
+        raise HTTPException(status_code=400, detail="No shows found for this event")
+    
+    venue_ids = {show.venue_id for show in shows}
+    venues = db.query(Venue).filter(Venue.id.in_(venue_ids)).all()
+
+    for venue in venues:
+        venue.name = payload.name
+        venue.formatted_address = payload.formatted_address
+        venue.latitude = payload.latitude
+        venue.longitude = payload.longitude
+
+    try:
+        db.commit()
+
+        # Notify users who booked any show of this event
+        bookings = db.query(Booking).join(EventShow).filter(
+            EventShow.event_id == event_id,
+            Booking.status == SeatBookingStatus.BOOKED
+        ).all()
+        unique_users = set(b.user_id for b in bookings)
+        
+        for uid in unique_users:
+            await manager.send_personal_message({
+                "type": "LOCATION_CHANGED",
+                "title": "Venue Updated",
+                "message": f"The location for {event.title} has been updated."
+            }, str(uid))
+
+        return {"status": "success", "message": "Event location updated successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to update event location")
+
+@router.put("/show/{show_id}/time")
+async def update_show_time(
+    show_id: UUID,
+    payload: ShowTimeUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    show = db.query(EventShow).join(Event).filter(
+        EventShow.id == show_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found")
+    
+    if show.is_cancelled:
+        raise HTTPException(status_code=400, detail="Cannot update time for a cancelled show")
+
+    duration = show.event.estimated_duration_minutes
+    show.start_time = payload.start_time
+    show.end_time = payload.start_time + timedelta(minutes=duration)
+
+    try:
+        db.commit()
+        
+        # Notify users who booked this show
+        bookings = db.query(Booking).filter(
+            Booking.event_show_id == show_id,
+            Booking.status == SeatBookingStatus.BOOKED
+        ).all()
+        unique_users = set(b.user_id for b in bookings)
+
+        formatted_time = show.start_time.strftime("%d %b %Y, %I:%M %p")
+        for uid in unique_users:
+            await manager.send_personal_message({
+                "type": "TIME_CHANGED",
+                "title": "Schedule Updated",
+                "message": f"The timing for {show.event.title} has been updated to {formatted_time}."
+            }, str(uid))
+
+        return {"status": "success", "message": "Show time updated successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to update show time")

@@ -28,3 +28,12 @@ class EventShowResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class ShowTimeUpdate(BaseModel):
+    start_time: datetime
+
+class VenueUpdate(BaseModel):
+    name: str
+    formatted_address: str
+    latitude: float
+    longitude: float

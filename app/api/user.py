@@ -19,6 +19,8 @@ from app.schemas.wallet import WalletDetailsResponse, WalletTransactionResponse
 from app.services.payment_service import PaymentService
 from app.core.config import settings
 from sqlalchemy import func
+from app.core.notifications import manager
+from app.models.event import Review
 
 router = APIRouter(prefix="/public/events", tags=["Public Events"])
 
@@ -26,18 +28,41 @@ router = APIRouter(prefix="/public/events", tags=["Public Events"])
 def list_active_events(db: Session = Depends(get_db)):
     now = datetime.now()
 
-    events = db.query(Event).join(Event.shows).join(EventShow.seat_layout).filter(
+    # Get events that have at least one valid upcoming show
+    events = db.query(Event).filter(
         Event.is_active == True,
-        EventShow.start_time > now,
-        EventShow.is_cancelled == False
-    ).options(
-        contains_eager(Event.shows).options(
-            joinedload(EventShow.venue),
-            contains_eager(EventShow.seat_layout)
+        Event.shows.any(
+            (EventShow.start_time > now) & 
+            (EventShow.is_cancelled == False) & 
+            (EventShow.seat_layout.has())
         )
     ).order_by(Event.created_at.desc()).all()
 
-    return events
+    # Manually attach upcoming shows to avoid join limits
+    event_list = []
+    for event in events:
+        upcoming_shows = db.query(EventShow).options(
+            joinedload(EventShow.venue)
+        ).filter(
+            EventShow.event_id == event.id,
+            EventShow.start_time > now,
+            EventShow.is_cancelled == False
+        ).order_by(EventShow.start_time.asc()).all()
+        
+        event_dict = {
+            "id": event.id,
+            "title": event.title,
+            "description": event.description,
+            "entry_type": event.entry_type,
+            "category": event.category,
+            "estimated_duration_minutes": event.estimated_duration_minutes,
+            "base_price": event.base_price,
+            "image_url": event.image_url,
+            "shows": upcoming_shows
+        }
+        event_list.append(event_dict)
+
+    return event_list
 
 # @router.get("/{event_id}")
 # def get_public_event_details(event_id: UUID, db: Session = Depends(get_db)):
@@ -59,25 +84,59 @@ def list_active_events(db: Session = Depends(get_db)):
 def get_public_event_details(event_id: UUID, db: Session = Depends(get_db)):
     now = datetime.now()
 
-    event = db.query(Event).join(Event.shows).join(EventShow.seat_layout).filter(
+    event = db.query(Event).options(
+        joinedload(Event.reviews).joinedload(Review.user)
+    ).filter(
         Event.id == event_id,
-        Event.is_active == True,
-        EventShow.start_time > now,
-        EventShow.is_cancelled == False
-    ).options(
-        contains_eager(Event.shows).options(
-            joinedload(EventShow.venue),
-            contains_eager(EventShow.seat_layout).joinedload(SeatLayout.sections)
-        )
-    ).populate_existing().first()
+        Event.is_active == True
+    ).first()
 
     if not event:
         raise HTTPException(
             status_code=404, 
-            detail="Event not found or has no upcoming shows with ready layouts."
+            detail="Event not found."
         )
 
-    return event
+    upcoming_shows = db.query(EventShow).options(
+        joinedload(EventShow.venue),
+        joinedload(EventShow.seat_layout).joinedload(SeatLayout.sections)
+    ).filter(
+        EventShow.event_id == event.id,
+        EventShow.start_time > now,
+        EventShow.is_cancelled == False
+    ).order_by(EventShow.start_time.asc()).all()
+    
+    if not upcoming_shows:
+        raise HTTPException(
+            status_code=404, 
+            detail="Event has no upcoming shows."
+        )
+
+    # Convert to dict to safely include reviews
+    event_dict = {
+        "id": event.id,
+        "title": event.title,
+        "description": event.description,
+        "entry_type": event.entry_type,
+        "category": event.category,
+        "estimated_duration_minutes": event.estimated_duration_minutes,
+        "base_price": event.base_price,
+        "image_url": event.image_url,
+        "is_active": event.is_active,
+        "shows": upcoming_shows,
+        "reviews": [
+            {
+                "id": str(r.id),
+                "rating": r.rating,
+                "comment": r.comment,
+                "created_at": r.created_at,
+                "user_id": str(r.user_id),
+                "user_name": r.user.name
+            } for r in event.reviews
+        ]
+    }
+
+    return event_dict
 
 
 
@@ -173,11 +232,14 @@ async def confirm_and_lock_seats(
         db.commit()
 
         return {
+            "has_active_lock": True,
             "booking_id": str(new_booking.id),
-            "order_id": razor_order['id'],
-            "amount": total_amount,
-            "key_id": settings.RAZORPAY_KEY_ID,
-            "expiry": expiry_time
+            "show_id": str(new_booking.event_show_id),
+            "seat_count": len(payload.seat_ids),
+            "expires_at": expiry_time,
+            "total_price": float(total_amount),
+            "razorpay_order_id": razor_order['id'],
+            "key_id": settings.RAZORPAY_KEY_ID
         }
 
     except Exception as e:
@@ -213,7 +275,8 @@ def get_active_user_lock(db: Session = Depends(get_db), current_user: User = Dep
         "seat_count": len(active_booking.seat_bookings),
         "expires_at": active_booking.locked_until,
         "total_price": float(latest_payment.amount) if latest_payment else 0,
-        "razorpay_order_id": latest_payment.razorpay_order_id if latest_payment else None
+        "razorpay_order_id": latest_payment.razorpay_order_id if latest_payment else None,
+        "key_id": settings.RAZORPAY_KEY_ID
     }
 
 @router.post("/booking/verify-payment")
@@ -275,6 +338,13 @@ async def verify_payment(
         admin.wallet.balance = float(admin.wallet.balance) + float(payment.amount)
 
         db.commit()
+        
+        await manager.send_personal_message({
+            "type": "TICKET_CONFIRMED",
+            "title": "Booking Confirmed",
+            "message": f"Your ticket for {event_show.event.title} is confirmed!"
+        }, str(current_user.id))
+
         return {
             "status": "success", 
             "message": "Tickets booked successfully!", 
@@ -287,6 +357,85 @@ async def verify_payment(
             raise e
         raise HTTPException(status_code=500, detail="Internal Server Error during verification.")
 
+
+@router.post("/booking/pay-with-wallet")
+async def pay_with_wallet(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        booking = db.query(Booking).options(
+            joinedload(Booking.seat_bookings),
+            joinedload(Booking.event_show)
+        ).filter(
+            Booking.user_id == current_user.id,
+            Booking.status == SeatBookingStatus.LOCKED,
+            Booking.locked_until > datetime.now()
+        ).order_by(Booking.created_at.desc()).first()
+
+        if not booking:
+            raise HTTPException(status_code=400, detail="No active locks found. Session may have expired.")
+
+        payment = db.query(Payment).filter(
+            Payment.user_id == current_user.id,
+            Payment.status == PaymentStatus.PENDING
+        ).order_by(Payment.created_at.desc()).first()
+
+        if not payment:
+            raise HTTPException(status_code=404, detail="Pending payment record not found.")
+
+        user_wallet = db.query(Wallet).filter(Wallet.user_id == current_user.id).first()
+        if not user_wallet or float(user_wallet.balance) < float(payment.amount):
+            raise HTTPException(status_code=400, detail="Insufficient wallet balance. Choose another payment option.")
+
+        admin = db.query(User).options(joinedload(User.wallet)).filter(User.role == UserRole.ADMIN).first()
+        if not admin or not admin.wallet:
+            raise HTTPException(status_code=500, detail="Admin wallet system not found.")
+
+        # Deduct from user
+        user_wallet.balance = float(user_wallet.balance) - float(payment.amount)
+        # Add to admin
+        admin.wallet.balance = float(admin.wallet.balance) + float(payment.amount)
+
+        # Record transactions
+        db.add(Transaction(
+            payment_id=payment.id,
+            sender_wallet_id=user_wallet.id,
+            receiver_wallet_id=admin.wallet.id,
+            amount=payment.amount,
+            tx_type=TransactionType.BOOKING,
+            description=f"Wallet Payment for Booking ID: {booking.id} - {len(booking.seat_bookings)} seats"
+        ))
+
+        payment.status = PaymentStatus.CAPTURED
+        # Optionally record that this was a wallet payment on the payment model if there is a method field
+
+        booking.status = SeatBookingStatus.BOOKED
+        booking.booked_at = func.now()
+
+        event_show = booking.event_show
+        if event_show:
+            event_show.total_revenue_collected = float(event_show.total_revenue_collected) + float(payment.amount)
+
+        db.commit()
+        
+        await manager.send_personal_message({
+            "type": "TICKET_CONFIRMED",
+            "title": "Booking Confirmed",
+            "message": f"Your ticket for {event_show.event.title} is confirmed via Wallet!"
+        }, str(current_user.id))
+
+        return {
+            "status": "success", 
+            "message": "Tickets booked successfully using Wallet!", 
+            "booking_id": str(booking.id)
+        }
+
+    except Exception as e:
+        db.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail="Internal Server Error during wallet payment.")
 
 @router.get("/booking/my-bookings")
 def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

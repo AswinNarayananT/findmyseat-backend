@@ -207,3 +207,73 @@ def add_event_review(
     db.refresh(new_review)
 
     return {"status": "success", "message": "Review added successfully"}
+
+@router.get("/pending-reviews")
+def get_pending_reviews(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    now = datetime.now(timezone.utc)
+    
+    # Subquery to find events the user has already reviewed
+    reviewed_events = db.query(Review.event_id).filter(Review.user_id == current_user.id).subquery()
+
+    # Query for bookings where user checked in, event has passed, and user has NOT reviewed the event yet
+    pending = db.query(Event).join(EventShow).join(Booking).filter(
+        Booking.user_id == current_user.id,
+        Booking.status == SeatBookingStatus.BOOKED,
+        Booking.is_checked_in == True,
+        EventShow.start_time < now,
+        ~Event.id.in_(reviewed_events)
+    ).distinct().all()
+
+    return [
+        {
+            "event_id": str(event.id),
+            "title": event.title,
+            "image_url": event.image_url
+        } for event in pending
+    ]
+
+@router.put("/{event_id}/reviews/{review_id}")
+def update_event_review(
+    event_id: UUID,
+    review_id: UUID,
+    review_data: ReviewCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    review = db.query(Review).filter(
+        Review.id == review_id,
+        Review.event_id == event_id,
+        Review.user_id == current_user.id
+    ).first()
+    
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found or you don't have permission to edit it.")
+
+    review.rating = review_data.rating
+    review.comment = review_data.comment
+    db.commit()
+    db.refresh(review)
+    return {"status": "success", "message": "Review updated successfully"}
+
+@router.delete("/{event_id}/reviews/{review_id}")
+def delete_event_review(
+    event_id: UUID,
+    review_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    review = db.query(Review).filter(
+        Review.id == review_id,
+        Review.event_id == event_id,
+        Review.user_id == current_user.id
+    ).first()
+    
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found or you don't have permission to delete it.")
+
+    db.delete(review)
+    db.commit()
+    return {"status": "success", "message": "Review deleted successfully"}
