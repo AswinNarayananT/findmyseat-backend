@@ -1,6 +1,14 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import DateTime, Integer, ForeignKey, Boolean
+from sqlalchemy import (
+    Text,
+    Numeric, 
+    ForeignKey, 
+    DateTime, 
+    Boolean, 
+    Integer, 
+    func
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -70,6 +78,21 @@ class EventShow(Base):
         nullable=False
     )
 
+    is_payout_processed: Mapped[bool] = mapped_column(
+        Boolean, 
+        nullable=False, 
+        default=False, 
+        server_default="false"
+    )
+    
+    total_revenue_collected: Mapped[float] = mapped_column(
+        Numeric(10, 2), 
+        nullable=False, 
+        default=0.0, 
+        server_default="0.0"
+    )
+    cancellation_reason: Mapped[str | None] = mapped_column(Text)
+    
     event = relationship("Event", back_populates="shows")
     venue = relationship("Venue", back_populates="shows")
     seat_layout = relationship(

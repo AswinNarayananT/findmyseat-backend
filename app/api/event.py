@@ -1,15 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload, contains_eager
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from typing import List
 from uuid import UUID
 
 from app.database.dependencies import get_db
 from app.core.security import get_current_user
-from app.models.event import Event
+from app.models.user import User
+from app.models.event import Event, Review
 from app.models.event_show import EventShow
 from app.models.venue import Venue
-from app.schemas.event import EventCreate, EventResponse
+from app.models.seat import Booking, SeatLayout, SeatBooking, SeatBookingStatus
+from app.schemas.event import EventCreate, EventResponse, ReviewCreate
 from app.schemas.event_show import EventShowCreate, EventShowResponse
 
 
@@ -29,6 +31,8 @@ def get_my_events(
     return events
 
 
+from datetime import datetime, timedelta, timezone
+
 @router.get("/{event_id}")
 def get_full_event_details(
     event_id: UUID,
@@ -36,7 +40,9 @@ def get_full_event_details(
     current_user = Depends(get_current_user)
 ):
     event = db.query(Event).options(
-        joinedload(Event.shows).joinedload(EventShow.seat_layout)
+        joinedload(Event.shows).joinedload(EventShow.seat_layout).joinedload(SeatLayout.seats),
+        joinedload(Event.shows).joinedload(EventShow.seat_layout).joinedload(SeatLayout.sections),
+        joinedload(Event.shows).joinedload(EventShow.venue)
     ).filter(
         Event.id == event_id,
         Event.organizer_id == current_user.id
@@ -45,7 +51,27 @@ def get_full_event_details(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    return event
+    now = datetime.now(timezone.utc)
+    active_shows = [
+        show for show in event.shows 
+        if (show.start_time + timedelta(minutes=event.estimated_duration_minutes)) > now
+    ]
+
+    # Find if any show already has a layout to act as the template
+    existing_layout = next((show.seat_layout for show in event.shows if show.seat_layout), None)
+
+    return {
+        "id": str(event.id),
+        "title": event.title,
+        "description": event.description,
+        "base_price": float(event.base_price),
+        "image_url": event.image_url,
+        "is_active": event.is_active,
+        "category": event.category,
+        "estimated_duration_minutes": event.estimated_duration_minutes,
+        "shows": active_shows,
+        "existing_layout": existing_layout # Send the layout directly
+    }
 
 
 @router.post("/create", response_model=EventResponse)
@@ -135,3 +161,49 @@ def create_event_show(
         db.refresh(show)
 
     return created_shows
+
+
+
+@router.post("/{event_id}/reviews")
+def add_event_review(
+    event_id: UUID,
+    review_data: ReviewCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    now = datetime.now(timezone.utc)
+
+    booking = db.query(Booking).join(EventShow).filter(
+        Booking.user_id == current_user.id,
+        EventShow.event_id == event_id,
+        Booking.status == SeatBookingStatus.BOOKED,
+        Booking.is_checked_in == True,
+        EventShow.start_time < now
+    ).first()
+
+    if not booking:
+        raise HTTPException(
+            status_code=403, 
+            detail="You can only review events you have attended and checked into."
+        )
+
+    existing_review = db.query(Review).filter(
+        Review.event_id == event_id,
+        Review.user_id == current_user.id
+    ).first()
+
+    if existing_review:
+        raise HTTPException(status_code=400, detail="You have already reviewed this event.")
+
+    new_review = Review(
+        event_id=event_id,
+        user_id=current_user.id,
+        rating=review_data.rating,
+        comment=review_data.comment
+    )
+
+    db.add(new_review)
+    db.commit()
+    db.refresh(new_review)
+
+    return {"status": "success", "message": "Review added successfully"}

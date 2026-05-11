@@ -2,10 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload, contains_eager
 from app.database.dependencies import get_db
 from uuid import UUID
+from datetime import datetime, timezone, timedelta
+
 from app.models.event import Event
 from app.models.event_show import EventShow
 from app.models.seat import Seat, SeatLayout, SeatSection, Booking, SeatBooking, SeatBookingStatus
-from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.models.user import User, UserRole
@@ -14,6 +15,7 @@ from app.models.finance import Payment, PaymentStatus , Wallet, Transaction, Tra
 from app.database.dependencies import get_db
 from app.core.security import get_current_user
 from app.schemas.seat import BookingRequestSchema
+from app.schemas.wallet import WalletDetailsResponse, WalletTransactionResponse
 from app.services.payment_service import PaymentService
 from app.core.config import settings
 from sqlalchemy import func
@@ -220,7 +222,6 @@ async def verify_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-
     is_valid = PaymentService.verify_payment(
         payload['razorpay_order_id'],
         payload['razorpay_payment_id'],
@@ -240,7 +241,8 @@ async def verify_payment(
         payment.razorpay_signature = payload['razorpay_signature']
 
         booking = db.query(Booking).options(
-            joinedload(Booking.seat_bookings)
+            joinedload(Booking.seat_bookings),
+            joinedload(Booking.event_show)
         ).filter(
             Booking.user_id == current_user.id,
             Booking.status == SeatBookingStatus.LOCKED,
@@ -252,6 +254,10 @@ async def verify_payment(
 
         booking.status = SeatBookingStatus.BOOKED
         booking.booked_at = func.now()
+
+        event_show = booking.event_show
+        if event_show:
+            event_show.total_revenue_collected = float(event_show.total_revenue_collected) + float(payment.amount)
 
         admin = db.query(User).options(joinedload(User.wallet)).filter(User.role == UserRole.ADMIN).first()
         
@@ -277,7 +283,6 @@ async def verify_payment(
 
     except Exception as e:
         db.rollback()
-        print(f"VERIFY ERROR: {str(e)}")
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail="Internal Server Error during verification.")
@@ -286,6 +291,7 @@ async def verify_payment(
 @router.get("/booking/my-bookings")
 def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
+        now = datetime.now(timezone.utc)
         bookings = (
             db.query(Booking)
             .options(
@@ -304,7 +310,7 @@ def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depend
         return [
             {
                 "id": str(b.id),
-                "event_show_id": str(b.event_show_id),
+                "event_id": str(b.event_show.event_id),
                 "event_name": b.event_show.event.title,
                 "event_image": b.event_show.event.image_url,
                 "event_date": b.event_show.start_time.strftime("%d %b %Y"),
@@ -314,6 +320,7 @@ def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depend
                 "status": b.status.value,            
                 "is_checked_in": b.is_checked_in,
                 "checked_in_at": b.checked_in_at,
+                "is_completed": b.event_show.start_time < now,
                 "total_seats": len(b.seat_bookings),
                 "seats": [
                     {
@@ -331,4 +338,6 @@ def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depend
     except Exception as e:
         print(f"CRITICAL API ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
 

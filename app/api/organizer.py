@@ -4,13 +4,16 @@ from uuid import uuid4
 from uuid import UUID
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
+from datetime import datetime, timezone
 
 
 from app.database.dependencies import get_db
 from app.core.security import get_current_user
 from app.models.user import User, UserRole
+from app.models.event import Event
 from app.models.event_show import EventShow
 from app.models.organizer_application import OrganizerApplication, OrganizerStatus
+from app.models.finance import Wallet, Transaction, TransactionType
 from app.schemas.organizer_application import (
     OrganizerApplicationCreate,
     OrganizerApplicationResponse
@@ -168,3 +171,262 @@ async def verify_checkin(
             ])
         }
     }
+
+
+@router.get("/revenue-summary")
+def get_organizer_revenue_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.ORGANIZER:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    now = datetime.now(timezone.utc)
+
+    events = db.query(Event).options(
+        joinedload(Event.shows)
+    ).filter(Event.organizer_id == current_user.id).all()
+
+    total_gross_revenue = 0.0
+    total_claimable = 0.0
+    event_details = []
+
+    for event in events:
+        event_revenue = 0.0
+        event_claimable = 0.0
+        show_details = []
+
+        for show in event.shows:
+            gross = float(show.total_revenue_collected)
+            organizer_share = gross * 0.90
+
+            status = "completed" if show.start_time < now else "upcoming"
+            
+            show_info = {
+                "show_id": str(show.id),
+                "start_time": show.start_time,
+                "gross_revenue": gross,
+                "organizer_share": organizer_share,
+                "is_payout_processed": show.is_payout_processed,
+                "status": status
+            }
+
+            event_revenue += gross
+            
+            if show.start_time < now and not show.is_payout_processed:
+                event_claimable += organizer_share
+            
+            show_details.append(show_info)
+
+        event_details.append({
+            "event_id": str(event.id),
+            "event_title": event.title,
+            "total_event_revenue": event_revenue,
+            "event_claimable_amount": event_claimable,
+            "shows": show_details
+        })
+
+        total_gross_revenue += event_revenue
+        total_claimable += event_claimable
+
+    return {
+        "summary": {
+            "total_gross_revenue": total_gross_revenue,
+            "total_organizer_share": total_gross_revenue * 0.90,
+            "total_admin_commission": total_gross_revenue * 0.10,
+            "total_claimable_now": total_claimable
+        },
+        "events": event_details
+    }
+
+
+@router.post("/organizer/claim-revenue")
+def claim_organizer_revenue(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.ORGANIZER:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    now = datetime.now(timezone.utc)
+
+    eligible_shows = db.query(EventShow).join(Event).filter(
+        Event.organizer_id == current_user.id,
+        EventShow.start_time < now,
+        EventShow.is_payout_processed == False,
+        EventShow.total_revenue_collected > 0
+    ).all()
+
+    if not eligible_shows:
+        raise HTTPException(status_code=400, detail="No claimable revenue found for completed events.")
+
+    total_gross = sum(float(s.total_revenue_collected) for s in eligible_shows)
+    claim_amount = total_gross * 0.90
+
+    admin = db.query(User).options(joinedload(User.wallet)).filter(User.role == UserRole.ADMIN).first()
+    organizer_wallet = db.query(Wallet).filter(Wallet.user_id == current_user.id).first()
+
+    if not admin or not admin.wallet or not organizer_wallet:
+        raise HTTPException(status_code=500, detail="Wallet system error")
+
+    admin.wallet.balance = float(admin.wallet.balance) - claim_amount
+    organizer_wallet.balance = float(organizer_wallet.balance) + claim_amount
+
+    new_tx = Transaction(
+        sender_wallet_id=admin.wallet.id,
+        receiver_wallet_id=organizer_wallet.id,
+        amount=claim_amount,
+        tx_type=TransactionType.PAYOUT,
+        description=f"Revenue claim for {len(eligible_shows)} completed shows (90% of ₹{total_gross})"
+    )
+    db.add(new_tx)
+
+    for show in eligible_shows:
+        show.is_payout_processed = True
+
+    try:
+        db.commit()
+        return {
+            "status": "success",
+            "claimed_amount": claim_amount,
+            "processed_shows_count": len(eligible_shows),
+            "new_wallet_balance": organizer_wallet.balance
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to process claim")
+    
+
+
+
+@router.post("/show/{show_id}/cancel")
+def cancel_event_show(
+    show_id: UUID,
+    reason: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    show = db.query(EventShow).join(Event).filter(
+        EventShow.id == show_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found")
+    if show.is_cancelled:
+        raise HTTPException(status_code=400, detail="Show already cancelled")
+    if show.is_payout_processed:
+        raise HTTPException(status_code=400, detail="Cannot cancel after revenue is claimed")
+
+    bookings = db.query(Booking).filter(
+        Booking.event_show_id == show_id,
+        Booking.status == SeatBookingStatus.BOOKED
+    ).all()
+
+    admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
+
+    for booking in bookings:
+        refund_amount = float(booking.total_price) 
+        user_wallet = db.query(Wallet).filter(Wallet.user_id == booking.user_id).first()
+
+        admin.wallet.balance = float(admin.wallet.balance) - refund_amount
+        user_wallet.balance = float(user_wallet.balance) + refund_amount
+
+        db.add(Transaction(
+            sender_wallet_id=admin.wallet.id,
+            receiver_wallet_id=user_wallet.id,
+            amount=refund_amount,
+            tx_type=TransactionType.REFUND,
+            description=f"Refund for cancelled show: {show.event.title}"
+        ))
+
+        booking.status = SeatBookingStatus.CANCELLED
+        for sb in booking.seat_bookings:
+            sb.status = SeatBookingStatus.CANCELLED
+
+    show.is_cancelled = True
+    show.cancellation_reason = reason
+
+    try:
+        db.commit()
+        return {"message": f"Show cancelled and {len(bookings)} refunds processed."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Refund processing failed")
+    
+from pydantic import BaseModel
+class Resonresponse(BaseModel):
+    reason:str
+
+@router.post("/event/{event_id}/cancel")
+def cancel_full_event(
+    event_id: UUID,
+    reason: Resonresponse,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(
+        Event.id == event_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    if event.is_cancelled:
+        raise HTTPException(status_code=400, detail="Event is already cancelled")
+
+    shows = db.query(EventShow).filter(
+        EventShow.event_id == event_id,
+        EventShow.is_cancelled == False
+    ).all()
+
+    admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
+    total_refunded_bookings = 0
+
+    for show in shows:
+        if show.is_payout_processed:
+            continue
+
+        bookings = db.query(Booking).filter(
+            Booking.event_show_id == show.id,
+            Booking.status == SeatBookingStatus.BOOKED
+        ).all()
+
+        for booking in bookings:
+            refund_amount = float(booking.total_price)
+            user_wallet = db.query(Wallet).filter(Wallet.user_id == booking.user_id).first()
+
+            admin.wallet.balance = float(admin.wallet.balance) - refund_amount
+            user_wallet.balance = float(user_wallet.balance) + refund_amount
+
+            db.add(Transaction(
+                sender_wallet_id=admin.wallet.id,
+                receiver_wallet_id=user_wallet.id,
+                amount=refund_amount,
+                tx_type=TransactionType.REFUND,
+                description=f"Full event cancellation refund: {event.title}"
+            ))
+
+            booking.status = SeatBookingStatus.CANCELLED
+            for sb in booking.seat_bookings:
+                sb.status = SeatBookingStatus.CANCELLED
+            
+            total_refunded_bookings += 1
+
+        show.is_cancelled = True
+        show.cancellation_reason = reason
+
+    event.is_cancelled = True
+    event.is_active = False
+
+    try:
+        db.commit()
+        return {
+            "status": "success", 
+            "message": f"Event and {len(shows)} shows cancelled. {total_refunded_bookings} bookings refunded."
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to process full event cancellation")

@@ -1,7 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException, Response, Header, status
 from sqlalchemy.orm import Session
 from app.database.dependencies import get_db
-from app.models.user import User
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session, joinedload
+from typing import Optional
+from sqlalchemy import func, extract
+from app.database.dependencies import get_db
+from app.models import Event, EventShow,Wallet
+from app.models.seat import Booking
+from app.models.finance import Wallet
+from app.models.user import User, UserRole
+from app.schemas.admin import AdminFinanceResponse
 from app.models.organizer_application import OrganizerApplication, OrganizerStatus, OrganizerApplicationHistory
 from app.core.security import get_current_user
 from app.schemas.user import UserLogin
@@ -234,3 +243,77 @@ def update_organizer_application_status(
     db.refresh(application)
 
     return application
+
+
+
+@router.get("/finance/global-summary", response_model=AdminFinanceResponse)
+def get_admin_finance_dashboard(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    organizer_id: Optional[UUID] = None,
+    month: Optional[int] = Query(None, ge=1, le=12),
+    year: Optional[int] = Query(None, ge=2024),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    query = db.query(EventShow).join(Event).join(User, Event.organizer_id == User.id)
+
+    if organizer_id:
+        query = query.filter(Event.organizer_id == organizer_id)
+    if month:
+        query = query.filter(extract('month', EventShow.start_time) == month)
+    if year:
+        query = query.filter(extract('year', EventShow.start_time) == year)
+
+    total_stats = db.query(
+        func.sum(EventShow.total_revenue_collected).label("gross"),
+        func.sum(EventShow.booked_count).label("tickets"),
+        func.count(Event.id.distinct()).label("events")
+    ).first()
+
+    monthly_query = db.query(
+        func.to_char(EventShow.start_time, 'Month YYYY').label("month_year"),
+        func.sum(EventShow.total_revenue_collected).label("monthly_gross"),
+        func.count(EventShow.id).label("monthly_shows")
+    ).group_by("month_year").all()
+
+    total_count = query.count()
+    total_pages = (total_count + limit - 1) // limit
+    shows_data = query.order_by(EventShow.start_time.desc()).offset((page - 1) * limit).limit(limit).all()
+
+    return {
+        "summary": {
+            "total_platform_gross": float(total_stats.gross or 0),
+            "total_admin_commission": float(total_stats.gross or 0) * 0.10,
+            "total_organizer_payouts": float(total_stats.gross or 0) * 0.90,
+            "active_events_count": total_stats.events or 0,
+            "total_tickets_sold": total_stats.tickets or 0
+        },
+        "monthly_breakdown": [
+            {
+                "month": m.month_year.strip(),
+                "gross_revenue": float(m.monthly_gross or 0),
+                "commission": float(m.monthly_gross or 0) * 0.10,
+                "show_count": m.monthly_shows
+            } for m in monthly_query
+        ],
+        "shows": [
+            {
+                "show_id": s.id,
+                "event_title": s.event.title,
+                "organizer_name": s.event.organizer.name,
+                "start_time": s.start_time,
+                "status": "cancelled" if s.is_cancelled else "active",
+                "tickets_sold": s.booked_count,
+                "gross_revenue": float(s.total_revenue_collected),
+                "admin_commission": float(s.total_revenue_collected) * 0.10,
+                "organizer_share": float(s.total_revenue_collected) * 0.90,
+                "is_payout_processed": s.is_payout_processed
+            } for s in shows_data
+        ],
+        "total_pages": total_pages,
+        "current_page": page
+    }

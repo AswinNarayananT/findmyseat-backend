@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException,Request, Response, status, Header
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.database.dependencies import get_db
 from app.models.user import User
-from app.models.finance import Wallet
+from app.models.finance import Wallet, Transaction
 from app.schemas.user import UserRegister, UserLogin, VerifyOtpRequest, ResendOtpRequest, ChangePasswordRequest, UpdateProfileSchema
+from app.schemas.wallet import WalletDetailsResponse, WalletTransactionResponse
 from datetime import datetime, timezone, timedelta
 from app.models.otp import OTP
 from app.core.otp import generate_otp, hash_otp
@@ -20,6 +21,8 @@ from app.core.security import (
     decode_refresh_token,
     get_current_user
 )
+
+
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -329,3 +332,32 @@ async def update_profile(
             "role": current_user.role,
         },
     }
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+
+@router.get("/wallet/me", response_model=WalletDetailsResponse)
+def get_my_wallet_details(
+    page: int = Query(1, ge=1),
+    size: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    wallet = db.query(Wallet).filter(Wallet.user_id == current_user.id).first()
+
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    offset = (page - 1) * size
+    
+    transactions = db.query(Transaction).filter(
+        or_(
+            Transaction.sender_wallet_id == wallet.id,
+            Transaction.receiver_wallet_id == wallet.id
+        )
+    ).order_by(Transaction.created_at.desc()).offset(offset).limit(size).all()
+
+    wallet.transactions = transactions
+    
+    return wallet
