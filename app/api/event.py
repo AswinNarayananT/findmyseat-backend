@@ -6,12 +6,13 @@ from uuid import UUID
 
 from app.database.dependencies import get_db
 from app.core.security import get_current_user
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.event import Event, Review
 from app.models.event_show import EventShow
 from app.models.venue import Venue
 from app.models.seat import Booking, SeatLayout, SeatBooking, SeatBookingStatus
-from app.schemas.event import EventCreate, EventResponse, ReviewCreate
+from app.models.finance import Wallet, Transaction, TransactionType, RedeemRequest, RedeemStatus
+from app.schemas.event import EventCreate, EventResponse, ReviewCreate, EventUpdate
 from app.schemas.event_show import EventShowCreate, EventShowResponse
 
 
@@ -42,7 +43,8 @@ def get_full_event_details(
     event = db.query(Event).options(
         joinedload(Event.shows).joinedload(EventShow.seat_layout).joinedload(SeatLayout.seats),
         joinedload(Event.shows).joinedload(EventShow.seat_layout).joinedload(SeatLayout.sections),
-        joinedload(Event.shows).joinedload(EventShow.venue)
+        joinedload(Event.shows).joinedload(EventShow.venue),
+        joinedload(Event.reviews).joinedload(Review.user)
     ).filter(
         Event.id == event_id,
         Event.organizer_id == current_user.id
@@ -51,14 +53,15 @@ def get_full_event_details(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    now = datetime.now(timezone.utc)
-    active_shows = [
-        show for show in event.shows 
-        if (show.start_time + timedelta(minutes=event.estimated_duration_minutes)) > now
-    ]
+    # Return all shows for the organizer so they can see history too
+    all_shows = event.shows
 
-    # Find if any show already has a layout to act as the template
     existing_layout = next((show.seat_layout for show in event.shows if show.seat_layout), None)
+
+    # Get the latest redeem request for this event
+    redeem_request = db.query(RedeemRequest).filter(
+        RedeemRequest.event_id == event_id
+    ).order_by(RedeemRequest.created_at.desc()).first()
 
     return {
         "id": str(event.id),
@@ -69,8 +72,20 @@ def get_full_event_details(
         "is_active": event.is_active,
         "category": event.category,
         "estimated_duration_minutes": event.estimated_duration_minutes,
-        "shows": active_shows,
-        "existing_layout": existing_layout # Send the layout directly
+        "shows": all_shows,
+        "existing_layout": existing_layout,
+        "redeem_status": redeem_request.status.value if redeem_request else None,
+        "redeem_notes": redeem_request.admin_notes if redeem_request else None,
+        "reviews": [
+            {
+                "id": str(r.id),
+                "rating": r.rating,
+                "comment": r.comment,
+                "created_at": r.created_at,
+                "user_name": r.user.name if r.user else "Anonymous",
+                "is_blocked": r.is_cancelled
+            } for r in event.reviews
+        ]
     }
 
 
@@ -103,6 +118,29 @@ def create_event(
     db.commit()
     db.refresh(event)
 
+    return event
+
+@router.put("/{event_id}", response_model=EventResponse)
+def update_event(
+    event_id: UUID,
+    event_update: EventUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(
+        Event.id == event_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    update_data = event_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(event, key, value)
+
+    db.commit()
+    db.refresh(event)
     return event
 
 
@@ -214,16 +252,14 @@ def get_pending_reviews(
     current_user: User = Depends(get_current_user)
 ):
     now = datetime.now(timezone.utc)
-    
-    # Subquery to find events the user has already reviewed
+
     reviewed_events = db.query(Review.event_id).filter(Review.user_id == current_user.id).subquery()
 
-    # Query for bookings where user checked in, event has passed, and user has NOT reviewed the event yet
     pending = db.query(Event).join(EventShow).join(Booking).filter(
         Booking.user_id == current_user.id,
         Booking.status == SeatBookingStatus.BOOKED,
         Booking.is_checked_in == True,
-        EventShow.start_time < now,
+         EventShow.start_time < now,
         ~Event.id.in_(reviewed_events)
     ).distinct().all()
 
@@ -277,3 +313,55 @@ def delete_event_review(
     db.delete(review)
     db.commit()
     return {"status": "success", "message": "Review deleted successfully"}
+
+@router.post("/{event_id}/redeem")
+def redeem_event_revenue(
+    event_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(
+        Event.id == event_id,
+        Event.organizer_id == current_user.id
+    ).options(joinedload(Event.shows)).first()
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    now = datetime.now(timezone.utc)
+    for show in event.shows:
+        show_end = show.start_time + timedelta(minutes=event.estimated_duration_minutes)
+        if show_end.tzinfo is None:
+            show_end = show_end.replace(tzinfo=timezone.utc)
+            
+        if show_end > now:
+            raise HTTPException(status_code=400, detail="Cannot redeem until all shows are completed")
+        if show.is_payout_processed:
+            raise HTTPException(status_code=400, detail="Payout already processed for one or more shows")
+
+    total_revenue = sum(float(show.total_revenue_collected) for show in event.shows)
+    if total_revenue <= 0:
+        raise HTTPException(status_code=400, detail="No revenue to redeem")
+
+    organizer_share = total_revenue * 0.9
+    admin_commission = total_revenue * 0.1
+
+    redeem_req = RedeemRequest(
+        event_id=event.id,
+        organizer_id=current_user.id,
+        total_amount=total_revenue,
+        commission_amount=admin_commission,
+        payable_amount=organizer_share,
+        status=RedeemStatus.PENDING
+    )
+    db.add(redeem_req)
+
+    for show in event.shows:
+        show.is_payout_processed = True
+
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": "Redemption request submitted for admin approval."
+    }

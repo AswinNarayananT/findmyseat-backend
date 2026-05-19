@@ -25,6 +25,8 @@ class EventShowResponse(BaseModel):
     start_time: datetime
     end_time: datetime
     capacity: int
+    is_payout_processed: bool
+    total_revenue_collected: float
 
     class Config:
         from_attributes = True

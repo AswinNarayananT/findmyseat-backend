@@ -132,7 +132,7 @@ def get_public_event_details(event_id: UUID, db: Session = Depends(get_db)):
                 "created_at": r.created_at,
                 "user_id": str(r.user_id),
                 "user_name": r.user.name
-            } for r in event.reviews
+            } for r in event.reviews if not r.is_cancelled
         ]
     }
 
@@ -156,12 +156,16 @@ def get_show_layout_details(show_id: UUID, db: Session = Depends(get_db)):
 
     if not show:
         raise HTTPException(status_code=404, detail="Show not found")
+    
+    # already_booked = db.query(Booking).filter(user==user_id,event_show_id==show_id)
+
 
     other_shows = db.query(EventShow).filter(
         EventShow.event_id == show.event_id,
         EventShow.id != show_id 
     ).order_by(EventShow.start_time).all()
-
+    
+    # if already_booked:
     return {
         "current_show": show,
         "other_shows": other_shows
@@ -305,7 +309,7 @@ async def verify_payment(
 
         booking = db.query(Booking).options(
             joinedload(Booking.seat_bookings),
-            joinedload(Booking.event_show)
+            joinedload(Booking.event_show).joinedload(EventShow.event)
         ).filter(
             Booking.user_id == current_user.id,
             Booking.status == SeatBookingStatus.LOCKED,
@@ -366,7 +370,7 @@ async def pay_with_wallet(
     try:
         booking = db.query(Booking).options(
             joinedload(Booking.seat_bookings),
-            joinedload(Booking.event_show)
+            joinedload(Booking.event_show).joinedload(EventShow.event)
         ).filter(
             Booking.user_id == current_user.id,
             Booking.status == SeatBookingStatus.LOCKED,
@@ -450,7 +454,7 @@ def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depend
             )
             .filter(
                 Booking.user_id == current_user.id,
-                Booking.status == SeatBookingStatus.BOOKED 
+                Booking.status.in_([SeatBookingStatus.BOOKED, SeatBookingStatus.CANCELLED])
             )
             .order_by(Booking.created_at.desc())
             .all()
@@ -464,6 +468,7 @@ def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depend
                 "event_image": b.event_show.event.image_url,
                 "event_date": b.event_show.start_time.strftime("%d %b %Y"),
                 "show_time": b.event_show.start_time.strftime("%I:%M %p"),
+                "show_time_raw": b.event_show.start_time.isoformat(),
                 "venue_name": b.event_show.venue.name,
                 "venue_address": b.event_show.venue.formatted_address,
                 "status": b.status.value,            
@@ -490,3 +495,117 @@ def get_user_bookings(db: Session = Depends(get_db), current_user: User = Depend
 
 
 
+@router.post("/booking/{booking_id}/cancel")
+async def cancel_user_booking(
+    booking_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        # 1. Fetch booking with details
+        booking = db.query(Booking).options(
+            joinedload(Booking.event_show).joinedload(EventShow.event),
+            joinedload(Booking.seat_bookings)
+        ).filter(
+            Booking.id == booking_id,
+            Booking.user_id == current_user.id
+        ).first()
+
+        if not booking:
+            raise HTTPException(status_code=404, detail="Booking not found.")
+
+        if booking.status != SeatBookingStatus.BOOKED:
+            raise HTTPException(status_code=400, detail="Only confirmed bookings can be cancelled.")
+
+        # 2. Verify Conditions
+        now = datetime.now(timezone.utc)
+        show_start_time = booking.event_show.start_time
+
+        # Ensure start_time has timezone info if it doesn't
+        if show_start_time.tzinfo is None:
+            show_start_time = show_start_time.replace(tzinfo=timezone.utc)
+
+        if booking.is_checked_in:
+            raise HTTPException(status_code=400, detail="Cannot cancel a ticket after check-in.")
+
+        if now >= show_start_time:
+            raise HTTPException(status_code=400, detail="Cannot cancel a ticket for an event that has already started.")
+
+        # Cancellation allowed only up to 1 hour before start
+        if now > (show_start_time - timedelta(hours=1)):
+            raise HTTPException(
+                status_code=400, 
+                detail="Cancellation is only allowed up to 1 hour before the event starts."
+            )
+
+        # 3. Calculate Refund Amount
+        # Find the transaction associated with this parent Booking ID
+        # We also check the description for backward compatibility with older bookings
+        transaction = db.query(Transaction).filter(
+            (Transaction.booking_id == booking.id) | (Transaction.description.like(f"%{booking.id}%")),
+            Transaction.tx_type == TransactionType.BOOKING
+        ).first()
+
+        if not transaction or not transaction.payment_id:
+             raise HTTPException(status_code=404, detail="Original payment record not found for refund.")
+
+        payment = db.query(Payment).filter(Payment.id == transaction.payment_id).first()
+        if not payment:
+             raise HTTPException(status_code=404, detail="Payment details not found.")
+
+        refund_amount = payment.amount
+
+        # 4. Process Refund (Admin -> User Wallet)
+        admin = db.query(User).options(joinedload(User.wallet)).filter(User.role == UserRole.ADMIN).first()
+        user_wallet = db.query(Wallet).filter(Wallet.user_id == current_user.id).first()
+
+        if not admin or not admin.wallet:
+            raise HTTPException(status_code=500, detail="Financial system error: Admin wallet not found.")
+        
+        if not user_wallet:
+            # Create wallet if it doesn't exist (though it should)
+            user_wallet = Wallet(user_id=current_user.id, balance=0.0)
+            db.add(user_wallet)
+            db.flush()
+
+        # Update Balances
+        admin.wallet.balance = float(admin.wallet.balance) - float(refund_amount)
+        user_wallet.balance = float(user_wallet.balance) + float(refund_amount)
+
+        # Create Refund Transaction
+        db.add(Transaction(
+            sender_wallet_id=admin.wallet.id,
+            receiver_wallet_id=user_wallet.id,
+            amount=refund_amount,
+            tx_type=TransactionType.REFUND,
+            description=f"Refund for cancelled Booking ID: {booking.id}",
+            payment_id=payment.id
+        ))
+
+        # 5. Update Booking and Show Status
+        booking.status = SeatBookingStatus.CANCELLED
+        payment.status = PaymentStatus.REFUNDED
+        
+        event_show = booking.event_show
+        event_show.total_revenue_collected = float(event_show.total_revenue_collected) - float(refund_amount)
+
+        db.commit()
+
+        await manager.send_personal_message({
+            "type": "TICKET_CANCELLED",
+            "title": "Booking Cancelled",
+            "message": f"Your booking for {event_show.event.title} has been cancelled. {refund_amount} has been refunded to your wallet."
+        }, str(current_user.id))
+
+        return {
+            "status": "success",
+            "message": "Booking cancelled successfully. Refund processed to wallet.",
+            "refund_amount": float(refund_amount)
+        }
+
+    except Exception as e:
+        db.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        print(f"Cancellation Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error during cancellation.")

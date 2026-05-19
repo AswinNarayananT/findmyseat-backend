@@ -73,3 +73,28 @@ class Transaction(Base):
 
     sender_wallet = relationship("Wallet", foreign_keys=[sender_wallet_id], back_populates="sent_transactions")
     receiver_wallet = relationship("Wallet", foreign_keys=[receiver_wallet_id], back_populates="received_transactions")
+
+class RedeemStatus(enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+class RedeemRequest(Base):
+    __tablename__ = "redeem_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("events.id"), nullable=False)
+    organizer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    
+    total_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    commission_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    payable_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    
+    status: Mapped[RedeemStatus] = mapped_column(Enum(RedeemStatus), default=RedeemStatus.PENDING)
+    admin_notes: Mapped[str | None] = mapped_column(String(500))
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    event = relationship("Event")
+    organizer = relationship("User")

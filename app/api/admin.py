@@ -6,12 +6,15 @@ from sqlalchemy.orm import Session, joinedload
 from typing import Optional
 from sqlalchemy import func, extract
 from app.database.dependencies import get_db
-from app.models import Event, EventShow,Wallet
+from app.models import Event, EventShow, Wallet
+from app.models.event import Review
 from app.models.seat import Booking
 from app.models.finance import Wallet
 from app.models.user import User, UserRole
 from app.schemas.admin import AdminFinanceResponse
 from app.models.organizer_application import OrganizerApplication, OrganizerStatus, OrganizerApplicationHistory
+from app.models.finance import Wallet, Transaction, TransactionType, RedeemRequest, RedeemStatus
+from datetime import datetime, timezone
 from app.core.security import get_current_user
 from app.schemas.user import UserLogin
 from app.schemas.organizer_application import OrganizerApplicationResponse, OrganizerStatusUpdate
@@ -24,6 +27,7 @@ from app.core.security import (
 from uuid import UUID
 from sqlalchemy.orm import Session, joinedload
 from app.core.notifications import manager
+from sqlalchemy import or_
 
 router = APIRouter(prefix="/admin", tags=["adminAuth"])
 
@@ -106,7 +110,6 @@ def logout(response: Response):
     return {"message": "Logged out successfully"}
 
 
-from sqlalchemy import or_
 
 @router.get(
     "/organizer-applications",
@@ -324,3 +327,171 @@ def get_admin_finance_dashboard(
         "total_pages": total_pages,
         "current_page": page
     }
+
+@router.get("/redeem-requests")
+def get_redeem_requests(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user)
+):
+    requests = db.query(RedeemRequest).options(
+        joinedload(RedeemRequest.event).joinedload(Event.reviews).joinedload(Review.user),
+        joinedload(RedeemRequest.organizer)
+    ).order_by(RedeemRequest.created_at.desc()).all()
+
+    for req in requests:
+        if req.event and req.event.reviews:
+            for review in req.event.reviews:
+                review.user_name = review.user.name if review.user else "Anonymous"
+    
+    return requests
+
+@router.post("/redeem-requests/{request_id}/process")
+async def process_redeem_request(
+    request_id: UUID,
+    status: str, 
+    admin_notes: Optional[str] = None,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(get_admin_user)
+):
+    req = db.query(RedeemRequest).options(
+        joinedload(RedeemRequest.event),
+        joinedload(RedeemRequest.organizer)
+    ).filter(RedeemRequest.id == request_id).first()
+
+    if not req:
+        raise HTTPException(status_code=404, detail="Redeem request not found")
+
+    if req.status != RedeemStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Request already processed")
+
+    if status == "approved":
+        admin_wallet = db.query(Wallet).filter(Wallet.user_id == admin_user.id).first()
+        organizer_wallet = db.query(Wallet).filter(Wallet.user_id == req.organizer_id).first()
+
+        if not admin_wallet or float(admin_wallet.balance) < float(req.payable_amount):
+            raise HTTPException(status_code=400, detail="Insufficient platform balance for payout")
+        
+        if not organizer_wallet:
+            organizer_wallet = Wallet(user_id=req.organizer_id, balance=0.0)
+            db.add(organizer_wallet)
+            db.flush()
+
+        admin_wallet.balance = float(admin_wallet.balance) - float(req.payable_amount)
+        organizer_wallet.balance = float(organizer_wallet.balance) + float(req.payable_amount)
+
+        db.add(Transaction(
+            sender_wallet_id=admin_wallet.id,
+            receiver_wallet_id=organizer_wallet.id,
+            amount=req.payable_amount,
+            tx_type=TransactionType.PAYOUT,
+            description=f"Approved Payout for Event: {req.event.title}. Total: {req.total_amount}, Fee (10%): {req.commission_amount}"
+        ))
+
+        req.status = RedeemStatus.APPROVED
+        
+        await manager.send_personal_message({
+            "type": "PAYOUT_APPROVED",
+            "title": "Payout Approved!",
+            "message": f"Your payout for {req.event.title} has been approved. ₹{req.payable_amount} added to your wallet."
+        }, str(req.organizer_id))
+
+    else:
+        req.status = RedeemStatus.REJECTED
+        
+        await manager.send_personal_message({
+            "type": "PAYOUT_REJECTED",
+            "title": "Payout Rejected",
+            "message": f"Your payout for {req.event.title} was rejected. Reason: {admin_notes or 'No reason provided.'}"
+        }, str(req.organizer_id))
+
+    req.admin_notes = admin_notes
+    req.processed_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {"status": "success", "message": f"Request {status} successfully"}
+
+@router.get("/users")
+def list_users(
+    role: Optional[str] = None,
+    is_blocked: Optional[bool] = None,
+    search: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user)
+):
+    query = db.query(User)
+    if role:
+        query = query.filter(User.role == role)
+    if is_blocked is not None:
+        query = query.filter(User.is_blocked == is_blocked)
+    if search:
+        query = query.filter(
+            (User.name.ilike(f"%{search}%")) | (User.email.ilike(f"%{search}%"))
+        )
+    
+    total = query.count()
+    users = query.order_by(User.created_at.desc()).offset((page-1)*limit).limit(limit).all()
+    
+    return {
+        "users": users,
+        "total": total,
+        "page": page,
+        "total_pages": (total + limit - 1) // limit
+    }
+
+@router.post("/users/{user_id}/toggle-block")
+def toggle_user_block(
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user)
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot block yourself")
+        
+    user.is_blocked = not user.is_blocked
+    db.commit()
+    return {"status": "success", "is_blocked": user.is_blocked}
+
+@router.get("/events-list")
+def list_all_events(
+    category: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    search: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user)
+):
+    query = db.query(Event).options(joinedload(Event.organizer))
+    if category:
+        query = query.filter(Event.category == category)
+    if is_active is not None:
+        query = query.filter(Event.is_active == is_active)
+    if search:
+        query = query.filter(Event.title.ilike(f"%{search}%"))
+        
+    total = query.count()
+    events = query.order_by(Event.created_at.desc()).offset((page-1)*limit).limit(limit).all()
+    
+    return {
+        "events": [
+            {
+                "id": str(e.id),
+                "title": e.title,
+                "category": e.category,
+                "is_active": e.is_active,
+                "created_at": e.created_at,
+                "organizer_name": e.organizer.name if e.organizer else "N/A",
+                "organizer_email": e.organizer.email if e.organizer else "N/A"
+            } for e in events
+        ],
+        "total": total,
+        "page": page,
+        "total_pages": (total + limit - 1) // limit
+    }
+

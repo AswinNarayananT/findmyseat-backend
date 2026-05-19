@@ -12,6 +12,15 @@ class EventCreate(BaseModel):
     estimated_duration_minutes: int
     base_price: float
     image_url: Optional[str] = None
+    
+class EventUpdate(BaseModel):
+    title: Optional[str] = Field(None, max_length=255)
+    description: Optional[str] = None
+    entry_type: Optional[EntryType] = None
+    category: Optional[EventCategory] = None
+    estimated_duration_minutes: Optional[int] = None
+    base_price: Optional[float] = None
+    image_url: Optional[str] = None
 
 
 class EventResponse(BaseModel):

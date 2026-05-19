@@ -11,14 +11,14 @@ from app.models.user import User, UserRole
 from app.models.event import Event
 from app.models.event_show import EventShow
 from app.models.organizer_application import OrganizerApplication, OrganizerStatus
-from app.models.finance import Wallet, Transaction, TransactionType
+from app.models.finance import Wallet, Transaction, TransactionType, RedeemRequest
 from app.schemas.organizer_application import (
     OrganizerApplicationCreate,
     OrganizerApplicationResponse
 )
 from app.schemas.event import CancelReasonRequest
 from app.schemas.event_show import VenueUpdate, ShowTimeUpdate
-from app.models.seat import Booking, SeatBooking, SeatBookingStatus
+from app.models.seat import Booking, SeatBooking, SeatBookingStatus, Seat
 from app.models.venue import Venue
 from datetime import timedelta
 from app.core.notifications import manager
@@ -142,7 +142,6 @@ async def verify_checkin(
     if not booking:
         raise HTTPException(status_code=404, detail="Invalid Ticket")
 
-    # Verify this booking belongs to the scanned show
     if booking.event_show_id != show_id:
         raise HTTPException(status_code=400, detail="Ticket is not valid for this show")
 
@@ -153,12 +152,21 @@ async def verify_checkin(
     if booking.status != SeatBookingStatus.BOOKED:
         raise HTTPException(status_code=400, detail="Ticket not confirmed")
 
-    # if booking.is_checked_in:
-    #     time_str = booking.checked_in_at.strftime('%I:%M %p')
-    #     raise HTTPException(status_code=400, detail=f"Already checked in at {time_str}")
+    now_date = datetime.now(timezone.utc).date()
+    show_date = booking.event_show.start_time.date()
+    
+    if show_date != now_date:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Tickets can only be verified on the day of the show (Show date: {show_date})."
+        )
 
-    # booking.is_checked_in = True
-    # booking.checked_in_at = func.now()
+    if booking.is_checked_in:
+        time_str = booking.checked_in_at.strftime('%I:%M %p') if booking.checked_in_at else "already"
+        raise HTTPException(status_code=400, detail=f"Already checked in at {time_str}")
+
+    booking.is_checked_in = True
+    booking.checked_in_at = datetime.now(timezone.utc)
     db.commit()
 
     return {
@@ -500,7 +508,6 @@ async def update_event_location(
     try:
         db.commit()
 
-        # Notify users who booked any show of this event
         bookings = db.query(Booking).join(EventShow).filter(
             EventShow.event_id == event_id,
             Booking.status == SeatBookingStatus.BOOKED
@@ -543,8 +550,7 @@ async def update_show_time(
 
     try:
         db.commit()
-        
-        # Notify users who booked this show
+
         bookings = db.query(Booking).filter(
             Booking.event_show_id == show_id,
             Booking.status == SeatBookingStatus.BOOKED
@@ -563,3 +569,151 @@ async def update_show_time(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to update show time")
+
+@router.get("/shows/{show_id}/attendees")
+def get_show_attendees(
+    show_id: UUID,
+    status_filter: str = "all", 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    show = db.query(EventShow).join(Event).filter(
+        EventShow.id == show_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found or you don't have permission.")
+
+    query = db.query(Booking).options(
+        joinedload(Booking.user),
+        joinedload(Booking.seat_bookings).joinedload(SeatBooking.seat).joinedload(Seat.section)
+    ).filter(
+        Booking.event_show_id == show_id,
+        Booking.status == SeatBookingStatus.BOOKED
+    )
+    
+    if status_filter == "checked_in":
+        query = query.filter(Booking.is_checked_in == True)
+    elif status_filter == "pending":
+        query = query.filter(Booking.is_checked_in == False)
+
+    bookings = query.order_by(Booking.booked_at.desc()).all()
+
+    attendees = []
+    for b in bookings:
+        seats = [f"{sb.seat.row_label}{sb.seat.seat_number} ({sb.seat.section.name})" for sb in b.seat_bookings if sb.seat.row_label]
+        
+        total_price = sum(float(sb.seat.section.price) for sb in b.seat_bookings if sb.seat.section)
+
+        attendees.append({
+            "booking_id": str(b.id),
+            "user_name": b.user.name,
+            "user_email": b.user.email,
+            "tickets_count": len(b.seat_bookings),
+            "seats": ", ".join(seats),
+            "total_paid": total_price,
+            "booked_at": b.booked_at,
+            "is_checked_in": b.is_checked_in
+        })
+
+    return attendees
+
+@router.post("/bookings/{booking_id}/check-in")
+def check_in_attendee(
+    booking_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    booking = db.query(Booking).join(EventShow).join(Event).filter(
+        Booking.id == booking_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found or permission denied.")
+
+    if booking.status != SeatBookingStatus.BOOKED:
+        raise HTTPException(status_code=400, detail="Booking is not valid.")
+
+    booking.is_checked_in = not booking.is_checked_in
+    if booking.is_checked_in:
+        booking.checked_in_at = datetime.now(timezone.utc)
+    else:
+        booking.checked_in_at = None
+
+    db.commit()
+    return {"status": "success", "is_checked_in": booking.is_checked_in}
+
+@router.post("/reviews/{review_id}/toggle-block")
+def toggle_review_block(
+    review_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from app.models.event import Review
+    review = db.query(Review).join(Event).filter(
+        Review.id == review_id,
+        Event.organizer_id == current_user.id
+    ).first()
+
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found or permission denied")
+
+    review.is_cancelled = not review.is_cancelled
+    db.commit()
+
+    return {
+        "status": "success", 
+        "message": f"Review {'blocked' if review.is_cancelled else 'unblocked'} successfully",
+        "is_blocked": review.is_cancelled
+    }
+
+@router.get("/dashboard-stats")
+def get_organizer_dashboard_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.ORGANIZER:
+        raise HTTPException(status_code=403, detail="Organizer access required")
+
+    events = db.query(Event).filter(Event.organizer_id == current_user.id).all()
+    event_ids = [e.id for e in events]
+    
+    total_events = len(events)
+    active_events = sum(1 for e in events if e.is_active and not e.is_cancelled)
+
+    if event_ids:
+        stats = db.query(
+            func.sum(EventShow.total_revenue_collected).label("total_revenue"),
+            func.sum(EventShow.booked_count).label("total_tickets")
+        ).filter(EventShow.event_id.in_(event_ids)).first()
+    else:
+        stats = type('obj', (object,), {'total_revenue': 0, 'total_tickets': 0})
+
+    wallet = db.query(Wallet).filter(Wallet.user_id == current_user.id).first()
+
+    payout_stats = db.query(
+        RedeemRequest.status,
+        func.count(RedeemRequest.id).label("count")
+    ).filter(RedeemRequest.organizer_id == current_user.id).group_by(RedeemRequest.status).all()
+
+    return {
+        "summary": {
+            "total_events": total_events,
+            "active_events": active_events,
+            "total_revenue": float(stats.total_revenue or 0),
+            "total_tickets": int(stats.total_tickets or 0),
+            "wallet_balance": float(wallet.balance if wallet else 0)
+        },
+        "payouts": {str(s.status.value): s.count for s in payout_stats},
+        "recent_events": [
+            {
+                "id": str(e.id),
+                "title": e.title,
+                "is_active": e.is_active,
+                "category": e.category,
+                "created_at": e.created_at
+            } for e in events[:5]
+        ]
+    }
